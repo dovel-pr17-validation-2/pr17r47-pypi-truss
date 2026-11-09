@@ -1,0 +1,1057 @@
+use axum::{
+    extract::State,
+    http::{HeaderMap as AxumHeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use baseten_performance_client_core::split_policy::{Combinable, SplitPolicy, Splittable};
+use baseten_performance_client_core::*;
+use serde_json::json;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+#[tokio::test]
+async fn test_embeddings_with_max_chars_per_request() {
+    let texts = vec![
+        "Short text".to_string(),
+        "This is a much longer text that should be placed in a different batch due to character limits".to_string(),
+        "Medium length text here".to_string(),
+        "Another very long piece of text that should also be batched separately due to the character limit".to_string(),
+    ];
+
+    // Test the split policy directly
+    let policy = SplitPolicy::max_chars_per_request(50, 4);
+    let batches = texts.split(&policy);
+
+    // Verify that batches respect character limits
+    assert!(!batches.is_empty(), "Should create at least one batch");
+
+    for batch in &batches {
+        let total_chars: usize = batch.iter().map(|s| s.chars().count()).sum();
+        println!(
+            "Batch with {} items has {} characters",
+            batch.len(),
+            total_chars
+        );
+        // Allow some flexibility in the algorithm
+        assert!(!batch.is_empty(), "No empty batches should be created");
+    }
+
+    // Test that very large character limits result in single batch
+    let policy_large = SplitPolicy::max_chars_per_request(1000, 4);
+    let large_batches = texts.split(&policy_large);
+    assert_eq!(
+        large_batches.len(),
+        1,
+        "Should create only one batch with large char limit"
+    );
+}
+
+#[tokio::test]
+async fn test_combine_responses() {
+    let response1 = CoreOpenAIEmbeddingsResponse {
+        object: "list".to_string(),
+        data: vec![CoreOpenAIEmbeddingData {
+            object: "embedding".to_string(),
+            embedding_internal: CoreEmbeddingVariant::FloatVector(vec![1.0, 2.0]),
+            index: 0,
+        }],
+        model: "test-model".to_string(),
+        usage: CoreOpenAIUsage {
+            prompt_tokens: 10,
+            total_tokens: 15,
+        },
+        total_time: 1.5,
+        individual_request_times: vec![1.0],
+        response_headers: Vec::new(),
+    };
+
+    let response2 = CoreOpenAIEmbeddingsResponse {
+        object: "list".to_string(),
+        data: vec![CoreOpenAIEmbeddingData {
+            object: "embedding".to_string(),
+            embedding_internal: CoreEmbeddingVariant::FloatVector(vec![3.0, 4.0]),
+            index: 1,
+        }],
+        model: "test-model".to_string(),
+        usage: CoreOpenAIUsage {
+            prompt_tokens: 8,
+            total_tokens: 12,
+        },
+        total_time: 2.0,
+        individual_request_times: vec![1.5],
+        response_headers: Vec::new(),
+    };
+
+    let combined = CoreOpenAIEmbeddingsResponse::combine(vec![response1, response2], 2);
+
+    assert_eq!(combined.data.len(), 2);
+    assert_eq!(combined.usage.prompt_tokens, 18);
+    assert_eq!(combined.usage.total_tokens, 27);
+    assert_eq!(combined.model, "test-model");
+
+    // Verify order is maintained
+    assert_eq!(combined.data[0].index, 0);
+    assert_eq!(combined.data[1].index, 1);
+
+    // check that individual request times are combined correctly
+    let times = &combined.individual_request_times;
+    assert_eq!(times.len(), 2);
+    assert_eq!(times[0], 1.0);
+    assert_eq!(times[1], 1.5);
+}
+
+#[test]
+fn test_rerank_response_combine() {
+    let response1 = CoreRerankResponse::new(
+        vec![CoreRerankResult {
+            index: 0,
+            score: 0.9,
+            text: Some("First text".to_string()),
+        }],
+        Some(1.0),
+        Some(vec![0.5]),
+    );
+
+    let response2 = CoreRerankResponse::new(
+        vec![CoreRerankResult {
+            index: 1,
+            score: 0.8,
+            text: Some("Second text".to_string()),
+        }],
+        Some(1.5),
+        Some(vec![0.7]),
+    );
+
+    let combined = CoreRerankResponse::combine(vec![response1, response2], 2);
+
+    assert_eq!(combined.data.len(), 2);
+    assert_eq!(combined.data[0].score, 0.9);
+    assert_eq!(combined.data[1].score, 0.8);
+
+    // Verify order is maintained by index
+    assert_eq!(combined.data[0].index, 0);
+    assert_eq!(combined.data[1].index, 1);
+}
+
+#[test]
+fn test_classification_response_combine() {
+    let response1 = CoreClassificationResponse::new(
+        vec![vec![CoreClassificationResult {
+            label: "positive".to_string(),
+            score: 0.95,
+        }]],
+        Some(1.0),
+        Some(vec![0.5]),
+    );
+
+    let response2 = CoreClassificationResponse::new(
+        vec![vec![CoreClassificationResult {
+            label: "negative".to_string(),
+            score: 0.85,
+        }]],
+        Some(1.5),
+        Some(vec![0.7]),
+    );
+
+    let combined = CoreClassificationResponse::combine(vec![response1, response2], 2);
+
+    assert_eq!(combined.data.len(), 2);
+    assert_eq!(combined.data[0][0].label, "positive");
+    assert_eq!(combined.data[1][0].label, "negative");
+}
+
+#[test]
+fn test_send_request_config_hedge_timeout_validation() {
+    // Test case 1: hedge delay higher than request delay (should fail)
+    // This validation is now done in RequestProcessingConfig, not SendRequestConfig
+    let pref = RequestProcessingPreference::new()
+        .with_timeout_s(1.0)
+        .with_hedge_delay(2.0); // hedge delay higher than timeout - should fail
+
+    let result = pref.pair_with_request_validate_and_convert(
+        "https://example.com".to_string(),
+        100,
+        "test_api_key".to_string(),
+    );
+    assert!(
+        result.is_err(),
+        "Should fail when hedge delay > request timeout"
+    );
+
+    // Test case 2: hedge delay equal to request timeout (should fail)
+    let pref2 = RequestProcessingPreference::new()
+        .with_timeout_s(1.0)
+        .with_hedge_delay(1.0); // hedge delay equal to timeout - should fail
+
+    let result2 = pref2.pair_with_request_validate_and_convert(
+        "https://example.com".to_string(),
+        100,
+        "test_api_key".to_string(),
+    );
+    assert!(
+        result2.is_err(),
+        "Should fail when hedge delay = request timeout"
+    );
+
+    // Test case 3: hedge delay lower than request timeout (should pass)
+    let pref3 = RequestProcessingPreference::new()
+        .with_timeout_s(1.0)
+        .with_hedge_delay(0.5); // hedge delay lower than timeout - should pass
+
+    let result3 = pref3.pair_with_request_validate_and_convert(
+        "https://example.com".to_string(),
+        100,
+        "test_api_key".to_string(),
+    );
+    assert!(
+        result3.is_ok(),
+        "Should pass when hedge delay < request timeout"
+    );
+
+    // Test case 4: no hedge budget (should succeed)
+    let pref4 = RequestProcessingPreference::new().with_timeout_s(1.0); // no hedge delay - should succeed
+
+    let result4 = pref4.pair_with_request_validate_and_convert(
+        "https://example.com".to_string(),
+        100,
+        "test_api_key".to_string(),
+    );
+    assert!(
+        result4.is_ok(),
+        "Should succeed when no hedge budget is specified"
+    );
+}
+
+#[derive(Clone)]
+struct TestServerState {
+    name: &'static str,
+    request_count: Arc<AtomicUsize>,
+    request_headers: Arc<Mutex<Vec<AxumHeaderMap>>>,
+    remaining_failures: Arc<Mutex<usize>>,
+    response_delay: Duration,
+    healthy: bool,
+    failure_status: StatusCode,
+}
+
+struct TestServer {
+    base_url: String,
+    request_count: Arc<AtomicUsize>,
+    request_headers: Arc<Mutex<Vec<AxumHeaderMap>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn start_test_server(
+    name: &'static str,
+    response_delay: Duration,
+    remaining_failures: usize,
+    healthy: bool,
+) -> TestServer {
+    start_test_server_with_failure_status(
+        name,
+        response_delay,
+        remaining_failures,
+        healthy,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await
+}
+
+async fn start_test_server_with_failure_status(
+    name: &'static str,
+    response_delay: Duration,
+    remaining_failures: usize,
+    healthy: bool,
+    failure_status: StatusCode,
+) -> TestServer {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_headers = Arc::new(Mutex::new(Vec::new()));
+    let state = TestServerState {
+        name,
+        request_count: Arc::clone(&request_count),
+        request_headers: request_headers.clone(),
+        remaining_failures: Arc::new(Mutex::new(remaining_failures)),
+        response_delay,
+        healthy,
+        failure_status,
+    };
+
+    let app = Router::new()
+        .route("/v1/embeddings", post(test_embeddings_handler))
+        .route("/batch-msgpack", post(test_msgpack_handler))
+        .route("/health", get(test_health_handler))
+        .route("/health/deep", get(test_health_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener should have local addr");
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test server should stay up");
+    });
+
+    TestServer {
+        base_url: format!("http://{}", addr),
+        request_count,
+        request_headers,
+        handle,
+    }
+}
+
+async fn test_health_handler(State(state): State<TestServerState>) -> impl IntoResponse {
+    if state.healthy {
+        (StatusCode::OK, Json(json!({"status": "healthy"}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "unhealthy"})),
+        )
+            .into_response()
+    }
+}
+
+async fn test_embeddings_handler(
+    State(state): State<TestServerState>,
+    headers: AxumHeaderMap,
+    Json(request): Json<CoreOpenAIEmbeddingsRequest>,
+) -> impl IntoResponse {
+    state.request_headers.lock().await.push(headers);
+    state.request_count.fetch_add(1, Ordering::SeqCst);
+
+    if !state.response_delay.is_zero() {
+        tokio::time::sleep(state.response_delay).await;
+    }
+
+    let mut remaining_failures = state.remaining_failures.lock().await;
+    if *remaining_failures > 0 {
+        *remaining_failures -= 1;
+        return (
+            state.failure_status,
+            Json(json!({"error": format!("{} failed", state.name)})),
+        )
+            .into_response();
+    }
+    drop(remaining_failures);
+
+    let mut headers = AxumHeaderMap::new();
+    headers.insert("x-test-server", HeaderValue::from_static(state.name));
+
+    let response = CoreOpenAIEmbeddingsResponse {
+        object: "list".to_string(),
+        data: request
+            .input
+            .iter()
+            .enumerate()
+            .map(|(index, _)| CoreOpenAIEmbeddingData {
+                object: "embedding".to_string(),
+                embedding_internal: CoreEmbeddingVariant::FloatVector(vec![0.1, 0.2, 0.3]),
+                index,
+            })
+            .collect(),
+        model: request.model,
+        usage: CoreOpenAIUsage {
+            prompt_tokens: 1,
+            total_tokens: 1,
+        },
+        total_time: 0.0,
+        individual_request_times: Vec::new(),
+        response_headers: Vec::new(),
+    };
+
+    (StatusCode::OK, headers, Json(response)).into_response()
+}
+
+async fn test_msgpack_handler(
+    State(state): State<TestServerState>,
+    request_headers: AxumHeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    state.request_count.fetch_add(1, Ordering::SeqCst);
+    let accept = request_headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let accept_encoding = request_headers
+        .get("accept-encoding")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    let response = rmpv::Value::Map(vec![
+        (rmpv::Value::from("format"), rmpv::Value::from("msgpack")),
+        (rmpv::Value::from("accept"), rmpv::Value::from(accept)),
+        (
+            rmpv::Value::from("accept_encoding"),
+            rmpv::Value::from(accept_encoding),
+        ),
+        (
+            rmpv::Value::from("received"),
+            serde_json::from_value(request).expect("request should convert to msgpack value"),
+        ),
+        (
+            rmpv::Value::from("bin"),
+            rmpv::Value::Binary(vec![0xde, 0xad, 0xbe, 0xef]),
+        ),
+    ]);
+    let body = rmp_serde::to_vec_named(&response).expect("test msgpack body should serialize");
+
+    let mut headers = AxumHeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("application/msgpack"),
+    );
+
+    (StatusCode::OK, headers, body).into_response()
+}
+
+fn single_request_preference() -> RequestProcessingPreference {
+    RequestProcessingPreference::new()
+        .with_max_concurrent_requests(1)
+        .with_batch_size(1)
+        .with_timeout_s(1.0)
+}
+
+fn health_check_wrapper() -> Arc<HttpClientWrapper> {
+    HttpClientWrapper::new(1, None).expect("test health-check client wrapper should build")
+}
+
+fn test_endpoint(base_url: &str) -> Endpoint {
+    Endpoint::new(EndpointConfig::new(
+        base_url.to_string(),
+        "test-key".to_string(),
+        health_check_wrapper(),
+    ))
+    .expect("endpoint should build")
+}
+
+fn test_endpoint_with_interval(base_url: &str, interval: Duration) -> Endpoint {
+    Endpoint::new(
+        EndpointConfig::new(
+            base_url.to_string(),
+            "test-key".to_string(),
+            health_check_wrapper(),
+        )
+        .with_health_check_interval(interval),
+    )
+    .expect("endpoint should build")
+}
+
+#[tokio::test]
+async fn test_batch_post_decodes_msgpack_response() {
+    let server = start_test_server("msgpack-endpoint", Duration::ZERO, 0, true).await;
+    let client = PerformanceClientCore::new(
+        server.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        None,
+    )
+    .expect("client should build");
+
+    let (responses, _) = client
+        .process_batch_post_requests(
+            "/batch-msgpack".to_string(),
+            vec![json!({"value": 42})],
+            &single_request_preference(),
+            HttpMethod::POST,
+        )
+        .await
+        .expect("batch_post msgpack response should parse");
+
+    assert_eq!(responses.len(), 1);
+    let msgpack_map = responses[0].0.as_map().expect("msgpack response is a map");
+    assert_eq!(
+        msgpack_map
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("bin"))
+            .map(|(_, value)| value.as_slice()),
+        Some(Some(&[0xde, 0xad, 0xbe, 0xef][..]))
+    );
+    let body = serde_json::to_value(&responses[0].0).expect("msgpack response converts to json");
+    assert_eq!(body["format"], "msgpack");
+    assert_eq!(body["received"], json!({"value": 42}));
+    assert!(body["accept"]
+        .as_str()
+        .is_some_and(|accept| accept.contains("application/msgpack")));
+    assert!(body["accept_encoding"]
+        .as_str()
+        .is_some_and(|accept_encoding| accept_encoding.contains("zstd")));
+    assert_eq!(
+        responses[0].1.get("content-type").map(String::as_str),
+        Some("application/msgpack")
+    );
+}
+
+#[tokio::test]
+async fn test_endpoint_pool_distributes_across_three_equal_weight_endpoints() {
+    let endpoint_a = start_test_server("endpoint-a", Duration::ZERO, 0, true).await;
+    let endpoint_b = start_test_server("endpoint-b", Duration::ZERO, 0, true).await;
+    let endpoint_c = start_test_server("endpoint-c", Duration::ZERO, 0, true).await;
+
+    let endpoint_pool = EndpointPool::new(EndpointPoolConfig::new(vec![
+        test_endpoint(&endpoint_a.base_url),
+        test_endpoint(&endpoint_b.base_url),
+        test_endpoint(&endpoint_c.base_url),
+    ]))
+    .expect("endpoint pool should build");
+
+    let client = PerformanceClientCore::new(
+        endpoint_a.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        Some(endpoint_pool),
+    )
+    .expect("client should build");
+
+    let preference = single_request_preference().with_hedge_budget_pct(0.0);
+
+    let mut winners = Vec::new();
+    for i in 0..24 {
+        let (_, _, headers, _) = client
+            .process_embeddings_requests(
+                vec![format!("request-{i}")],
+                "test-model".to_string(),
+                None,
+                None,
+                None,
+                &preference,
+            )
+            .await
+            .expect("request should succeed");
+        winners.push(headers[0]["x-test-server"].clone());
+    }
+
+    assert!(winners.iter().any(|winner| winner == "endpoint-a"));
+    assert!(winners.iter().any(|winner| winner == "endpoint-b"));
+    assert!(winners.iter().any(|winner| winner == "endpoint-c"));
+}
+
+#[tokio::test]
+async fn test_retry_uses_alternate_endpoint_from_pool() {
+    let endpoint_a = start_test_server("endpoint-a", Duration::ZERO, 1, true).await;
+    let endpoint_b = start_test_server("endpoint-b", Duration::ZERO, 0, true).await;
+    let endpoint_c = start_test_server("endpoint-c", Duration::ZERO, 0, true).await;
+
+    let endpoint_pool = EndpointPool::new(
+        EndpointPoolConfig::new(vec![
+            test_endpoint(&endpoint_a.base_url),
+            test_endpoint(&endpoint_b.base_url),
+            test_endpoint(&endpoint_c.base_url),
+        ])
+        .with_weights(vec![1.0, 0.0, 0.0]),
+    )
+    .expect("endpoint pool should build");
+
+    let client = PerformanceClientCore::new(
+        endpoint_a.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        Some(endpoint_pool),
+    )
+    .expect("client should build");
+
+    let preference = single_request_preference()
+        .with_max_retries(1)
+        .with_retry_budget_pct(1.0)
+        .with_hedge_budget_pct(0.0);
+
+    let (_, _, headers, _) = client
+        .process_embeddings_requests(
+            vec!["retry me".to_string()],
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await
+        .expect("retry should succeed via an alternate endpoint");
+
+    assert_ne!(
+        headers[0].get("x-test-server").map(String::as_str),
+        Some("endpoint-a")
+    );
+    assert_eq!(endpoint_a.request_count.load(Ordering::SeqCst), 1);
+    let alternate_request_count = endpoint_b.request_count.load(Ordering::SeqCst)
+        + endpoint_c.request_count.load(Ordering::SeqCst);
+    assert_eq!(alternate_request_count, 1);
+}
+
+#[tokio::test]
+async fn test_empty_non_retryable_status_codes_keeps_default_retry_policy() {
+    let status_529 = StatusCode::from_u16(529).expect("529 is a valid status code");
+    let endpoint =
+        start_test_server_with_failure_status("endpoint", Duration::ZERO, 1, true, status_529)
+            .await;
+
+    let client = PerformanceClientCore::new(
+        endpoint.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        None,
+    )
+    .expect("client should build");
+
+    let preference = single_request_preference()
+        .with_max_retries(1)
+        .with_hedge_budget_pct(0.0)
+        .with_non_retryable_status_codes(HashSet::new());
+
+    client
+        .process_embeddings_requests(
+            vec!["retry me".to_string()],
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await
+        .expect("empty non-retryable override should keep default 5xx retry");
+
+    assert_eq!(endpoint.request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_non_retryable_status_codes_disable_default_5xx_retry() {
+    let status_529 = StatusCode::from_u16(529).expect("529 is a valid status code");
+    let endpoint =
+        start_test_server_with_failure_status("endpoint", Duration::ZERO, 1, true, status_529)
+            .await;
+
+    let client = PerformanceClientCore::new(
+        endpoint.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        None,
+    )
+    .expect("client should build");
+
+    let preference = single_request_preference()
+        .with_max_retries(1)
+        .with_hedge_budget_pct(0.0)
+        .with_non_retryable_status_codes(HashSet::from([529]));
+
+    let result = client
+        .process_embeddings_requests(
+            vec!["do not retry me".to_string()],
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await;
+
+    assert!(result.is_err(), "529 should not be retried when overridden");
+    assert_eq!(endpoint.request_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_pin_initial_endpoint_once_keeps_initial_batch_requests_on_one_endpoint() {
+    let endpoint_a = start_test_server("endpoint-a", Duration::ZERO, 0, true).await;
+    let endpoint_b = start_test_server("endpoint-b", Duration::ZERO, 0, true).await;
+    let endpoint_c = start_test_server("endpoint-c", Duration::ZERO, 0, true).await;
+
+    let endpoint_pool = EndpointPool::new(EndpointPoolConfig::new(vec![
+        test_endpoint(&endpoint_a.base_url),
+        test_endpoint(&endpoint_b.base_url),
+        test_endpoint(&endpoint_c.base_url),
+    ]))
+    .expect("endpoint pool should build");
+
+    let client = PerformanceClientCore::new(
+        endpoint_a.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        Some(endpoint_pool),
+    )
+    .expect("client should build");
+
+    let preference = RequestProcessingPreference::new()
+        .with_max_concurrent_requests(3)
+        .with_batch_size(1)
+        .with_timeout_s(1.0)
+        .with_hedge_budget_pct(0.0)
+        .with_pin_initial_endpoint_once(true);
+
+    let mut chosen_servers = Vec::new();
+
+    for operation_index in 0..24 {
+        let (_, _, headers, _) = client
+            .process_embeddings_requests(
+                vec![
+                    format!("request-{operation_index}-1"),
+                    format!("request-{operation_index}-2"),
+                    format!("request-{operation_index}-3"),
+                ],
+                "test-model".to_string(),
+                None,
+                None,
+                None,
+                &preference,
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(headers.len(), 3);
+        let first_server = headers[0]
+            .get("x-test-server")
+            .expect("response should include x-test-server")
+            .clone();
+        assert!(headers
+            .iter()
+            .all(|header| header.get("x-test-server") == Some(&first_server)));
+        chosen_servers.push(first_server);
+    }
+
+    let distinct_servers: std::collections::HashSet<_> = chosen_servers.iter().cloned().collect();
+    assert!(
+        distinct_servers.len() > 1,
+        "pinned operations should still distribute across multiple endpoints over time"
+    );
+
+    let request_counts = [
+        endpoint_a.request_count.load(Ordering::SeqCst),
+        endpoint_b.request_count.load(Ordering::SeqCst),
+        endpoint_c.request_count.load(Ordering::SeqCst),
+    ];
+    assert_eq!(request_counts.iter().sum::<usize>(), 24 * 3);
+}
+
+#[tokio::test]
+async fn test_hedge_uses_alternate_endpoint_from_pool() {
+    let endpoint_a = start_test_server("endpoint-a", Duration::from_millis(600), 0, true).await;
+    let endpoint_b = start_test_server("endpoint-b", Duration::ZERO, 0, true).await;
+    let endpoint_c = start_test_server("endpoint-c", Duration::ZERO, 0, true).await;
+
+    let endpoint_pool = EndpointPool::new(
+        EndpointPoolConfig::new(vec![
+            test_endpoint(&endpoint_a.base_url),
+            test_endpoint(&endpoint_b.base_url),
+            test_endpoint(&endpoint_c.base_url),
+        ])
+        .with_weights(vec![1.0, 0.0, 0.0]),
+    )
+    .expect("endpoint pool should build");
+
+    let client = PerformanceClientCore::new(
+        endpoint_a.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        Some(endpoint_pool),
+    )
+    .expect("client should build");
+
+    let preference = single_request_preference()
+        .with_max_retries(0)
+        .with_hedge_delay(0.2)
+        .with_hedge_budget_pct(1.0);
+
+    let (_, _, headers, _) = client
+        .process_embeddings_requests(
+            vec!["hedge me".to_string()],
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await
+        .expect("hedged request should succeed");
+
+    assert_ne!(
+        headers[0].get("x-test-server").map(String::as_str),
+        Some("endpoint-a")
+    );
+    assert_eq!(endpoint_a.request_count.load(Ordering::SeqCst), 1);
+    let alternate_request_count = endpoint_b.request_count.load(Ordering::SeqCst)
+        + endpoint_c.request_count.load(Ordering::SeqCst);
+    assert_eq!(alternate_request_count, 1);
+}
+
+#[tokio::test]
+async fn test_hedge_budget_caps_hedges_when_every_request_is_slow() {
+    // A fleet-wide slowdown: every request takes longer than the hedge delay,
+    // so all in-flight requests reach the hedge timer at roughly the same time.
+    let endpoint = start_test_server("slow-endpoint", Duration::from_millis(400), 0, true).await;
+
+    let client = PerformanceClientCore::new(
+        endpoint.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        None,
+    )
+    .expect("client should build");
+
+    let total_requests = 200;
+    let hedge_budget_pct = 0.05;
+    // Mirrors RequestProcessingConfig::calculate_budget: max(2, 1 + ceil(n * pct)).
+    let expected_hedges = std::cmp::max(
+        2,
+        1 + (total_requests as f64 * hedge_budget_pct).ceil() as usize,
+    );
+
+    let preference = RequestProcessingPreference::new()
+        .with_max_concurrent_requests(total_requests)
+        .with_batch_size(1)
+        .with_timeout_s(5.0)
+        .with_hedge_delay(0.1)
+        .with_hedge_budget_pct(hedge_budget_pct)
+        .with_max_retries(0);
+
+    let inputs = (0..total_requests)
+        .map(|i| format!("input-{i}"))
+        .collect::<Vec<_>>();
+
+    client
+        .process_embeddings_requests(
+            inputs,
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await
+        .expect("slow requests should still succeed");
+
+    let hedges_sent = endpoint.request_count.load(Ordering::SeqCst) - total_requests;
+    assert_eq!(
+        hedges_sent, expected_hedges,
+        "hedges must stay within the hedge budget even when every request is slow"
+    );
+}
+
+#[tokio::test]
+async fn test_background_health_worker_skips_unhealthy_endpoints() {
+    let endpoint_a = start_test_server("endpoint-a", Duration::ZERO, 0, true).await;
+    let endpoint_b = start_test_server("endpoint-b", Duration::ZERO, 0, false).await;
+    let endpoint_c = start_test_server("endpoint-c", Duration::ZERO, 0, true).await;
+
+    let endpoint_pool = EndpointPool::new(EndpointPoolConfig::new(vec![
+        test_endpoint_with_interval(&endpoint_a.base_url, Duration::from_millis(100)),
+        test_endpoint_with_interval(&endpoint_b.base_url, Duration::from_millis(100)),
+        test_endpoint_with_interval(&endpoint_c.base_url, Duration::from_millis(100)),
+    ]))
+    .expect("endpoint pool should build");
+
+    let client = PerformanceClientCore::new(
+        endpoint_a.base_url.clone(),
+        Some("test-key".to_string()),
+        1,
+        None,
+        None,
+        Some(endpoint_pool.clone()),
+    )
+    .expect("client should build");
+
+    let preference = single_request_preference().with_hedge_budget_pct(0.0);
+
+    client
+        .process_embeddings_requests(
+            vec!["prime worker".to_string()],
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await
+        .expect("request should start the health worker");
+
+    let unhealthy_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = endpoint_pool.health_snapshot();
+        let endpoint_b_healthy = snapshot
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.base_url == endpoint_b.base_url)
+            .map(|endpoint| endpoint.healthy);
+
+        if endpoint_b_healthy == Some(false) {
+            break;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < unhealthy_deadline,
+            "endpoint-b should become unhealthy after failed health checks"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (_, _, second_headers, _) = client
+        .process_embeddings_requests(
+            vec!["after health update".to_string()],
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await
+        .expect("request should skip unhealthy endpoint");
+    let (_, _, third_headers, _) = client
+        .process_embeddings_requests(
+            vec!["one more".to_string()],
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            &preference,
+        )
+        .await
+        .expect("request should keep skipping unhealthy endpoint");
+
+    assert_ne!(
+        second_headers[0].get("x-test-server").map(String::as_str),
+        Some("endpoint-b")
+    );
+    assert_ne!(
+        third_headers[0].get("x-test-server").map(String::as_str),
+        Some("endpoint-b")
+    );
+    assert_eq!(endpoint_b.request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_explicit_trace_context() {
+    const PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03";
+    for (enabled, retry, hedge, state) in [
+        (false, false, false, None),
+        (true, false, false, None),
+        (true, true, false, Some("vendor=value")),
+        (true, false, true, Some("vendor=value")),
+    ] {
+        let delay = if hedge {
+            Duration::from_millis(100)
+        } else {
+            Duration::ZERO
+        };
+        let server = start_test_server("tracing", delay, usize::from(retry), true).await;
+        let client = PerformanceClientCore::new(
+            server.base_url.clone(),
+            Some("test-key".into()),
+            1,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut preference = single_request_preference()
+            .with_max_retries(1)
+            .with_retry_budget_pct(1.0);
+        if enabled {
+            preference = preference.with_trace_context(TraceContext {
+                traceparent: PARENT.into(),
+                tracestate: state.map(str::to_string),
+            });
+        }
+        if hedge {
+            preference = preference.with_hedge_delay(0.05).with_hedge_budget_pct(1.0);
+        }
+        client
+            .process_embeddings_requests(
+                vec!["first batch".into(), "second batch".into()],
+                "test-model".into(),
+                None,
+                None,
+                None,
+                &preference,
+            )
+            .await
+            .unwrap();
+        let headers = server.request_headers.lock().await;
+        assert!(headers.len() >= if retry || hedge { 3 } else { 2 });
+        for request in headers.iter() {
+            assert_eq!(
+                request.get_all("traceparent").iter().count(),
+                usize::from(enabled)
+            );
+            assert_eq!(
+                request.get("traceparent").map(|v| v.to_str().unwrap()),
+                enabled.then_some(PARENT)
+            );
+            assert_eq!(
+                request.get("tracestate").map(|v| v.to_str().unwrap()),
+                state
+            );
+        }
+        assert!(
+            preference.extra_headers.is_none(),
+            "caller preference must stay unchanged"
+        );
+    }
+}
+
+#[test]
+fn test_trace_context_rejects_conflicting_or_unsafe_headers() {
+    use baseten_performance_client_core::split_policy::RequestProcessingConfig;
+    let context = TraceContext {
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+        tracestate: None,
+    };
+    for header in ["TraceParent", "TRACEstate"] {
+        let preference = single_request_preference()
+            .with_trace_context(context.clone())
+            .with_extra_headers([(header.into(), "duplicate".into())].into());
+        let error = RequestProcessingConfig::new_from_preference(
+            &preference,
+            "http://localhost".into(),
+            1,
+            "test-key".into(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+    for (parent, state) in [
+        ("", None),
+        ("bad\r\nheader", None),
+        (context.traceparent.as_str(), Some("bad\nstate")),
+    ] {
+        let preference = single_request_preference().with_trace_context(TraceContext {
+            traceparent: parent.into(),
+            tracestate: state.map(str::to_string),
+        });
+        assert!(RequestProcessingConfig::new_from_preference(
+            &preference,
+            "http://localhost".into(),
+            1,
+            "test-key".into(),
+        )
+        .is_err());
+    }
+}

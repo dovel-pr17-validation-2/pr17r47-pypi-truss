@@ -1,0 +1,49 @@
+# Check & fix all locally: `pre-commit run --files $(git diff --name-only HEAD)`.
+fail_fast: false
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: trailing-whitespace
+        exclude: "docs/chains/doc_gen/reference.patch"
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: fix-byte-order-marker
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: debug-statements
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff analyze and fix
+        entry: uv run ruff check --force-exclude --fix --exit-non-zero-on-fix
+        # NB(nikhil): `uv` requires system over python (here and below) due to assumptions pre-commit makes about venvs.
+        language: system
+        files: \.(py|pyi)$
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        files: \.(py|pyi)$
+      - id: mypy
+        name: mypy-local
+        entry: uv run mypy
+        language: system
+        types: [python]
+        exclude: ^examples/|^truss/test.+/|model.py$
+        pass_filenames: true
+      - id: uv-lock
+        name: uv lock
+        entry: uv lock
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+      - id: check-truss-config-schema
+        name: check truss config schema is up to date
+        entry: uv run bin/generate_truss_config_schema.py --check
+        language: system
+        files: (truss/base/|truss/config\.schema\.json$)
+        pass_filenames: false

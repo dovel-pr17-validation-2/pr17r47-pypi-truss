@@ -1,0 +1,719 @@
+#![allow(clippy::too_many_arguments)]
+
+use baseten_performance_client_core::{
+  CancellationToken as CoreCancellationToken, ClientError, CoreClassificationResponse,
+  CoreEmbeddingVariant, CoreOpenAIEmbeddingsResponse, CoreRerankResponse, Endpoint as CoreEndpoint,
+  EndpointConfig as CoreEndpointConfig, EndpointPool as CoreEndpointPool, EndpointPoolConfig,
+  HttpClientWrapper as HttpClientWrapperRs, PerformanceClientCore,
+  RequestProcessingPreference as RustRequestProcessingPreference, DEFAULT_BATCH_SIZE,
+  DEFAULT_CONCURRENCY, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_S, DEFAULT_TIMEOUT_IS_NO_VOTE,
+  HEDGE_BUDGET_PERCENTAGE, INITIAL_BACKOFF_MS, RETRY_BUDGET_PERCENTAGE,
+};
+
+use napi_derive::napi;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+// Use constants from core crate - no more hardcoded values!
+
+// Helper function to create NAPI errors
+fn create_napi_error(msg: &str) -> napi::Error {
+  napi::Error::new(napi::Status::InvalidArg, msg)
+}
+
+// Convert core client errors to NAPI errors
+fn convert_core_error_to_napi_error(error: ClientError) -> napi::Error {
+  match error {
+    ClientError::InvalidParameter(msg) => create_napi_error(&msg),
+    ClientError::Network(msg) => napi::Error::new(napi::Status::GenericFailure, msg),
+    ClientError::Http {
+      status: _,
+      message,
+      customer_request_id: _,
+    } => napi::Error::new(napi::Status::GenericFailure, message),
+    ClientError::Connect(msg) => napi::Error::new(napi::Status::GenericFailure, msg),
+    ClientError::Serialization(msg) => napi::Error::new(napi::Status::GenericFailure, msg),
+    ClientError::LocalTimeout(msg, _) => napi::Error::new(
+      napi::Status::GenericFailure,
+      format!("Local timeout: {}", msg),
+    ),
+    ClientError::RemoteTimeout(msg, _) => napi::Error::new(
+      napi::Status::GenericFailure,
+      format!("Remote timeout: {}", msg),
+    ),
+    ClientError::Cancellation(msg) => napi::Error::new(napi::Status::GenericFailure, msg),
+  }
+}
+
+// Response types for Node.js (simplified for napi compatibility)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIEmbeddingData {
+  pub object: String,
+  pub embedding: Vec<f32>,
+  pub index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIUsage {
+  pub prompt_tokens: u32,
+  pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIEmbeddingsResponse {
+  pub object: String,
+  pub data: Vec<OpenAIEmbeddingData>,
+  pub model: String,
+  pub usage: OpenAIUsage,
+  pub total_time: f64,
+  pub individual_request_times: Vec<f64>,
+  pub response_headers: Vec<HashMap<String, String>>,
+}
+
+impl From<CoreOpenAIEmbeddingsResponse> for OpenAIEmbeddingsResponse {
+  fn from(core_response: CoreOpenAIEmbeddingsResponse) -> Self {
+    Self {
+      object: core_response.object,
+      data: core_response
+        .data
+        .into_iter()
+        .map(|data| {
+          let embedding = match data.embedding_internal {
+            CoreEmbeddingVariant::FloatVector(vec) => vec,
+            CoreEmbeddingVariant::Base64(_) => {
+              // For now, return empty vec for base64 - could be enhanced later
+              Vec::new()
+            }
+          };
+          OpenAIEmbeddingData {
+            object: data.object,
+            embedding,
+            index: data.index as u32,
+          }
+        })
+        .collect(),
+      model: core_response.model,
+      usage: OpenAIUsage {
+        prompt_tokens: core_response.usage.prompt_tokens,
+        total_tokens: core_response.usage.total_tokens,
+      },
+      total_time: core_response.total_time,
+      individual_request_times: core_response.individual_request_times,
+      response_headers: core_response.response_headers,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResult {
+  pub index: u32,
+  pub score: f64,
+  pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResponse {
+  pub object: String,
+  pub data: Vec<RerankResult>,
+  pub total_time: f64,
+  pub individual_request_times: Vec<f64>,
+  pub response_headers: Vec<HashMap<String, String>>,
+}
+
+impl From<CoreRerankResponse> for RerankResponse {
+  fn from(core_response: CoreRerankResponse) -> Self {
+    Self {
+      object: core_response.object,
+      data: core_response
+        .data
+        .into_iter()
+        .map(|result| RerankResult {
+          index: result.index as u32,
+          score: result.score,
+          text: result.text,
+        })
+        .collect(),
+      total_time: core_response.total_time,
+      individual_request_times: core_response.individual_request_times,
+      response_headers: core_response.response_headers,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationResult {
+  pub label: String,
+  pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationResponse {
+  pub object: String,
+  pub data: Vec<Vec<ClassificationResult>>,
+  pub total_time: f64,
+  pub individual_request_times: Vec<f64>,
+  pub response_headers: Vec<HashMap<String, String>>,
+}
+
+impl From<CoreClassificationResponse> for ClassificationResponse {
+  fn from(core_response: CoreClassificationResponse) -> Self {
+    Self {
+      object: core_response.object,
+      data: core_response
+        .data
+        .into_iter()
+        .map(|group| {
+          group
+            .into_iter()
+            .map(|result| ClassificationResult {
+              label: result.label,
+              score: result.score,
+            })
+            .collect()
+        })
+        .collect(),
+      total_time: core_response.total_time,
+      individual_request_times: core_response.individual_request_times,
+      response_headers: core_response.response_headers,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchPostResponse {
+  pub data: Vec<JsonValue>,
+  pub response_headers: Vec<HashMap<String, String>>,
+  pub individual_request_times: Vec<f64>,
+  pub total_time: f64,
+}
+
+/// User-facing configuration for request processing with budget percentages.
+/// CancellationToken for cancelling async operations
+#[napi]
+pub struct CancellationToken {
+  inner: CoreCancellationToken,
+}
+
+#[napi]
+impl CancellationToken {
+  /// Create a new cancellation token
+  #[napi(constructor)]
+  #[allow(clippy::new_without_default)]
+  pub fn new() -> Self {
+    Self {
+      inner: CoreCancellationToken::new(false),
+    }
+  }
+
+  /// Cancel all operations using this token
+  #[napi]
+  pub fn cancel(&self) {
+    self.inner.cancel();
+  }
+
+  /// Check if cancellation has been requested
+  #[napi(getter)]
+  pub fn is_cancelled(&self) -> bool {
+    self.inner.is_cancelled()
+  }
+}
+
+/// Explicit caller-owned W3C parent context.
+#[napi(object)]
+pub struct TraceContext {
+  pub traceparent: String,
+  pub tracestate: Option<String>,
+}
+
+/// Provides sensible defaults and getters for all properties.
+#[napi]
+pub struct RequestProcessingPreference {
+  // Store the complete preference with defaults applied for consistent behavior
+  complete: RustRequestProcessingPreference,
+}
+
+#[napi]
+impl RequestProcessingPreference {
+  #[napi(constructor)]
+  pub fn new(
+    max_concurrent_requests: Option<u32>,
+    batch_size: Option<u32>,
+    timeout_s: Option<f64>,
+    max_chars_per_request: Option<u32>,
+    pin_initial_endpoint_once: Option<bool>,
+    hedge_delay: Option<f64>,
+    total_timeout_s: Option<f64>,
+    hedge_budget_pct: Option<f64>,
+    retry_budget_pct: Option<f64>,
+    max_retries: Option<u32>,
+    initial_backoff_ms: Option<u32>,
+    cancel_token: Option<&CancellationToken>,
+    primary_api_key_override: Option<String>,
+    extra_headers: Option<HashMap<String, String>>,
+    non_retryable_status_codes: Option<Vec<u16>>,
+    trace_context: Option<TraceContext>,
+  ) -> Self {
+    let non_retryable_status_codes: Option<HashSet<u16>> =
+      non_retryable_status_codes.map(|codes| codes.into_iter().collect());
+    let inner = RustRequestProcessingPreference {
+      max_concurrent_requests: max_concurrent_requests.map(|x| x as usize),
+      batch_size: batch_size.map(|x| x as usize),
+      max_chars_per_request: max_chars_per_request.map(|x| x as usize),
+      pin_initial_endpoint_once,
+      timeout_s,
+      hedge_delay,
+      total_timeout_s,
+      hedge_budget_pct,
+      retry_budget_pct,
+      max_retries,
+      initial_backoff_ms: initial_backoff_ms.map(|x| x as u64),
+      cancel_token: cancel_token.map(|token| token.inner.clone()),
+      primary_api_key_override,
+      extra_headers,
+      non_retryable_status_codes,
+      trace_context: trace_context.map(|context| baseten_performance_client_core::TraceContext {
+        traceparent: context.traceparent,
+        tracestate: context.tracestate,
+      }),
+    };
+
+    // Apply defaults using the same method as Rust core
+    let complete = inner.with_defaults();
+
+    RequestProcessingPreference { complete }
+  }
+
+  #[napi(setter)]
+  pub fn set_trace_context(&mut self, context: Option<TraceContext>) {
+    self.complete.trace_context =
+      context.map(|context| baseten_performance_client_core::TraceContext {
+        traceparent: context.traceparent,
+        tracestate: context.tracestate,
+      });
+  }
+
+  #[napi(getter)]
+  pub fn trace_context(&self) -> Option<TraceContext> {
+    self
+      .complete
+      .trace_context
+      .as_ref()
+      .map(|context| TraceContext {
+        traceparent: context.traceparent.clone(),
+        tracestate: context.tracestate.clone(),
+      })
+  }
+
+  #[napi(getter)]
+  pub fn max_concurrent_requests(&self) -> u32 {
+    self
+      .complete
+      .max_concurrent_requests
+      .unwrap_or(DEFAULT_CONCURRENCY) as u32
+  }
+
+  #[napi(getter)]
+  pub fn batch_size(&self) -> u32 {
+    self.complete.batch_size.unwrap_or(DEFAULT_BATCH_SIZE) as u32
+  }
+
+  #[napi(getter)]
+  pub fn timeout_s(&self) -> f64 {
+    self.complete.timeout_s.unwrap_or(DEFAULT_REQUEST_TIMEOUT_S)
+  }
+
+  #[napi(getter)]
+  pub fn max_chars_per_request(&self) -> Option<u32> {
+    self.complete.max_chars_per_request.map(|x| x as u32)
+  }
+
+  #[napi(getter)]
+  pub fn hedge_delay(&self) -> Option<f64> {
+    self.complete.hedge_delay
+  }
+
+  #[napi(getter)]
+  pub fn pin_initial_endpoint_once(&self) -> bool {
+    self.complete.pin_initial_endpoint_once.unwrap_or(false)
+  }
+
+  #[napi(getter)]
+  pub fn total_timeout_s(&self) -> Option<f64> {
+    self.complete.total_timeout_s
+  }
+
+  #[napi(getter)]
+  pub fn hedge_budget_pct(&self) -> f64 {
+    self
+      .complete
+      .hedge_budget_pct
+      .unwrap_or(HEDGE_BUDGET_PERCENTAGE)
+  }
+
+  #[napi(getter)]
+  pub fn retry_budget_pct(&self) -> f64 {
+    self
+      .complete
+      .retry_budget_pct
+      .unwrap_or(RETRY_BUDGET_PERCENTAGE)
+  }
+
+  #[napi(getter)]
+  pub fn max_retries(&self) -> u32 {
+    self.complete.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
+  }
+
+  #[napi(getter)]
+  pub fn initial_backoff_ms(&self) -> u32 {
+    self
+      .complete
+      .initial_backoff_ms
+      .unwrap_or(INITIAL_BACKOFF_MS) as u32
+  }
+
+  #[napi(getter)]
+  pub fn primary_api_key_override(&self) -> Option<String> {
+    self.complete.primary_api_key_override.clone()
+  }
+
+  #[napi(getter)]
+  pub fn extra_headers(&self) -> Option<HashMap<String, String>> {
+    self.complete.extra_headers.clone()
+  }
+
+  #[napi(getter)]
+  pub fn non_retryable_status_codes(&self) -> Vec<u16> {
+    let mut status_codes: Vec<u16> = self
+      .complete
+      .non_retryable_status_codes
+      .clone()
+      .unwrap_or_default()
+      .into_iter()
+      .collect();
+    status_codes.sort_unstable();
+    status_codes
+  }
+}
+
+#[napi]
+pub struct HttpClientWrapper {
+  inner: Arc<HttpClientWrapperRs>,
+}
+
+#[napi]
+impl HttpClientWrapper {
+  #[napi(constructor)]
+  pub fn new(http_version: Option<u8>, proxy: Option<String>) -> napi::Result<Self> {
+    let http_version = http_version.unwrap_or(1);
+    let inner =
+      HttpClientWrapperRs::new(http_version, proxy).map_err(convert_core_error_to_napi_error)?;
+    Ok(Self { inner })
+  }
+}
+
+#[napi]
+pub struct Endpoint {
+  inner: CoreEndpoint,
+}
+
+#[napi]
+impl Endpoint {
+  #[napi(constructor)]
+  pub fn new(
+    base_url: String,
+    api_key: String,
+    client_wrapper: &HttpClientWrapper,
+    deep_health_url: Option<String>,
+    deployment_health_path: Option<String>,
+    health_check_interval_s: Option<f64>,
+    health_check_timeout_s: Option<f64>,
+    health_check_retries: Option<u32>,
+    health_fail_on_first: Option<bool>,
+    deployment_timeout_is_no_vote: Option<bool>,
+    deep_timeout_is_no_vote: Option<bool>,
+  ) -> napi::Result<Self> {
+    let mut config = CoreEndpointConfig::new(base_url, api_key, Arc::clone(&client_wrapper.inner));
+    if let Some(interval_s) = health_check_interval_s {
+      config = config.with_health_check_interval(std::time::Duration::from_secs_f64(interval_s));
+    }
+    if let Some(timeout_s) = health_check_timeout_s {
+      config = config.with_health_check_timeout(std::time::Duration::from_secs_f64(timeout_s));
+    }
+    if let Some(retries) = health_check_retries {
+      config = config.with_health_check_retries(retries);
+    }
+    config = config.with_standard_health_checks(
+      deep_health_url,
+      health_fail_on_first.unwrap_or(false),
+      deployment_health_path,
+      deployment_timeout_is_no_vote.unwrap_or(DEFAULT_TIMEOUT_IS_NO_VOTE),
+      deep_timeout_is_no_vote.unwrap_or(DEFAULT_TIMEOUT_IS_NO_VOTE),
+    );
+
+    let inner = CoreEndpoint::new(config).map_err(convert_core_error_to_napi_error)?;
+    Ok(Self { inner })
+  }
+}
+
+#[napi]
+pub struct EndpointPool {
+  inner: Arc<CoreEndpointPool>,
+}
+
+#[napi]
+impl EndpointPool {
+  #[napi(constructor)]
+  pub fn new(endpoints: Vec<&Endpoint>, endpoint_weights: Option<Vec<f64>>) -> napi::Result<Self> {
+    if endpoints.is_empty() {
+      return Err(create_napi_error("endpoints must not be empty"));
+    }
+
+    let mut config = EndpointPoolConfig::new(
+      endpoints
+        .into_iter()
+        .map(|endpoint| endpoint.inner.clone())
+        .collect(),
+    );
+    if let Some(weights) = endpoint_weights {
+      config = config.with_weights(weights);
+    }
+
+    let inner = CoreEndpointPool::new(config).map_err(convert_core_error_to_napi_error)?;
+    Ok(Self { inner })
+  }
+}
+
+#[napi]
+pub struct PerformanceClient {
+  core_client: PerformanceClientCore,
+}
+
+#[napi]
+impl PerformanceClient {
+  #[napi(constructor)]
+  pub fn new(
+    base_url: String,
+    api_key: Option<String>,
+    http_version: Option<u8>,
+    client_wrapper: Option<&HttpClientWrapper>,
+    proxy: Option<String>,
+    endpoint_pool: Option<&EndpointPool>,
+  ) -> napi::Result<Self> {
+    let http_version = http_version.unwrap_or(1);
+    let wrapper = client_wrapper.map(|c| Arc::clone(&c.inner));
+    let endpoint_pool = endpoint_pool.map(|pool| Arc::clone(&pool.inner));
+    let core_client = PerformanceClientCore::new(
+      base_url,
+      api_key,
+      http_version,
+      wrapper,
+      proxy,
+      endpoint_pool,
+    )
+    .map_err(convert_core_error_to_napi_error)?;
+
+    Ok(Self { core_client })
+  }
+
+  #[napi]
+  pub fn get_client_wrapper(&self) -> HttpClientWrapper {
+    HttpClientWrapper {
+      inner: self.core_client.get_client_wrapper(),
+    }
+  }
+
+  #[napi]
+  pub async fn embed(
+    &self,
+    input: Vec<String>,
+    model: String,
+    encoding_format: Option<String>,
+    dimensions: Option<u32>,
+    user: Option<String>,
+    preference: Option<&RequestProcessingPreference>,
+  ) -> napi::Result<serde_json::Value> {
+    if input.is_empty() {
+      return Err(create_napi_error("Input list cannot be empty"));
+    }
+
+    let pref = preference.map(|p| p.complete.clone()).unwrap_or_default();
+
+    let result = self
+      .core_client
+      .process_embeddings_requests(input, model, encoding_format, dimensions, user, &pref)
+      .await
+      .map_err(convert_core_error_to_napi_error)?;
+
+    let (core_response, batch_durations, headers, total_time) = result;
+    let mut response = OpenAIEmbeddingsResponse::from(core_response);
+    response.total_time = total_time.as_secs_f64();
+    response.individual_request_times = batch_durations
+      .into_iter()
+      .map(|d: std::time::Duration| d.as_secs_f64())
+      .collect();
+    response.response_headers = headers;
+
+    serde_json::to_value(response)
+      .map_err(|e| create_napi_error(&format!("Serialization error: {}", e)))
+  }
+
+  #[napi]
+  pub async fn rerank(
+    &self,
+    query: String,
+    texts: Vec<String>,
+    raw_scores: Option<bool>,
+    model: Option<String>,
+    return_text: Option<bool>,
+    truncate: Option<bool>,
+    truncation_direction: Option<String>,
+    preference: Option<&RequestProcessingPreference>,
+  ) -> napi::Result<serde_json::Value> {
+    if texts.is_empty() {
+      return Err(create_napi_error("Texts list cannot be empty"));
+    }
+
+    let pref = preference.map(|p| p.complete.clone()).unwrap_or_default();
+
+    let result = self
+      .core_client
+      .process_rerank_requests(
+        query,
+        texts,
+        raw_scores.unwrap_or(false),
+        model,
+        return_text.unwrap_or(false),
+        truncate.unwrap_or(false),
+        truncation_direction.unwrap_or_else(|| "Right".to_string()),
+        &pref,
+      )
+      .await
+      .map_err(convert_core_error_to_napi_error)?;
+
+    let (core_response, batch_durations, headers, total_time) = result;
+    let mut response = RerankResponse::from(core_response);
+    response.total_time = total_time.as_secs_f64();
+    response.individual_request_times = batch_durations
+      .into_iter()
+      .map(|d: std::time::Duration| d.as_secs_f64())
+      .collect();
+    response.response_headers = headers;
+
+    serde_json::to_value(response)
+      .map_err(|e| create_napi_error(&format!("Serialization error: {}", e)))
+  }
+
+  #[napi]
+  pub async fn classify(
+    &self,
+    inputs: Vec<String>,
+    model: Option<String>,
+    raw_scores: Option<bool>,
+    truncate: Option<bool>,
+    truncation_direction: Option<String>,
+    preference: Option<&RequestProcessingPreference>,
+  ) -> napi::Result<serde_json::Value> {
+    if inputs.is_empty() {
+      return Err(create_napi_error("Inputs list cannot be empty"));
+    }
+
+    let pref = preference.map(|p| p.complete.clone()).unwrap_or_default();
+
+    let result = self
+      .core_client
+      .process_classify_requests(
+        inputs,
+        model,
+        raw_scores.unwrap_or(false),
+        truncate.unwrap_or(false),
+        truncation_direction.unwrap_or_else(|| "Right".to_string()),
+        &pref,
+      )
+      .await
+      .map_err(convert_core_error_to_napi_error)?;
+
+    let (core_response, batch_durations, headers, total_time) = result;
+    let mut response = ClassificationResponse::from(core_response);
+    response.total_time = total_time.as_secs_f64();
+    response.individual_request_times = batch_durations
+      .into_iter()
+      .map(|d: std::time::Duration| d.as_secs_f64())
+      .collect();
+    response.response_headers = headers;
+
+    serde_json::to_value(response)
+      .map_err(|e| create_napi_error(&format!("Serialization error: {}", e)))
+  }
+
+  /// Send one System One POST per request, preserving response order and backend fields.
+  #[napi(js_name = "batchSystemOne")]
+  pub async fn batch_system_one(
+    &self,
+    requests: Vec<JsonValue>,
+    preference: Option<&RequestProcessingPreference>,
+  ) -> napi::Result<serde_json::Value> {
+    self
+      .batch_post(
+        baseten_performance_client_core::SYSTEM_ONE_PATH.into(),
+        requests,
+        preference,
+        None,
+      )
+      .await
+  }
+
+  // TODO: This JSON-compatible return type cannot preserve MessagePack binary, invalid UTF-8
+  // strings, or maps with non-string keys. The API return type is subject to change when those
+  // values are exposed through native JavaScript types.
+  #[napi]
+  pub async fn batch_post(
+    &self,
+    url_path: String,
+    payloads: Vec<JsonValue>,
+    preference: Option<&RequestProcessingPreference>,
+    method: Option<String>,
+  ) -> napi::Result<serde_json::Value> {
+    if payloads.is_empty() {
+      return Err(create_napi_error("Payloads list cannot be empty"));
+    }
+
+    let pref = preference.map(|p| p.complete.clone()).unwrap_or_default();
+
+    // Parse method parameter using core function
+    let http_method =
+      baseten_performance_client_core::http::HttpMethod::from_optional_str(method.as_deref())
+        .map_err(|e| create_napi_error(&e))?;
+
+    let result = self
+      .core_client
+      .process_batch_post_requests(url_path, payloads, &pref, http_method)
+      .await
+      .map_err(convert_core_error_to_napi_error)?;
+
+    let (results, total_time) = result;
+    let mut data = Vec::new();
+    let mut response_headers = Vec::new();
+    let mut individual_request_times = Vec::new();
+
+    for (json_value, headers, duration) in results {
+      data.push(
+        serde_json::to_value(json_value)
+          .map_err(|e| create_napi_error(&format!("Serialization error: {}", e)))?,
+      );
+      response_headers.push(headers);
+      individual_request_times.push(duration.as_secs_f64());
+    }
+
+    let response = BatchPostResponse {
+      data,
+      response_headers,
+      individual_request_times,
+      total_time: total_time.as_secs_f64(),
+    };
+
+    serde_json::to_value(response)
+      .map_err(|e| create_napi_error(&format!("Serialization error: {}", e)))
+  }
+}

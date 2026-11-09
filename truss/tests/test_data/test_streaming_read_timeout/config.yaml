@@ -1,0 +1,11 @@
+model_metadata: {}
+model_name: null
+model_type: custom
+requirements: []
+resources:
+  accelerator: null
+  cpu: 500m
+  memory: 512Mi
+  use_gpu: false
+runtime:
+  streaming_read_timeout: 1

@@ -1,0 +1,7 @@
+model_name: Test Annotated Types
+requirements: []
+resources:
+  cpu: 500m
+  memory: 512Mi
+  use_gpu: false
+system_packages: []

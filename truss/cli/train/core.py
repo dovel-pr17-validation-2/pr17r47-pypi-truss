@@ -1,0 +1,970 @@
+import base64
+import json
+import os
+import tarfile
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple
+
+import click
+import requests
+import rich
+from InquirerPy import inquirer
+from rich.text import Text
+
+from truss.cli import remote_cli
+from truss.cli.train import common, deploy_checkpoints
+from truss.cli.train.metrics_watcher import MetricsWatcher
+from truss.cli.train.types import (
+    DeployCheckpointArgs,
+    DeployCheckpointsConfigComplete,
+    DeploySuccessResult,
+)
+from truss.cli.utils import common as cli_common
+from truss.cli.utils.output import console
+from truss.remote.baseten.remote import BasetenRemote
+from truss_train import loader
+from truss_train.definitions import (
+    AvailabilityModel,
+    CheckpointList,
+    DeployCheckpointsConfig,
+)
+
+QUEUED_JOB_STATUSES = ["TRAINING_JOB_PENDING"]
+
+ACTIVE_JOB_STATUSES = [
+    "TRAINING_JOB_RUNNING",
+    "TRAINING_JOB_CREATED",
+    "TRAINING_JOB_DEPLOYING",
+]
+
+# Human-readable labels for a job's `availability_model`. STANDARD is
+# non-preemptible capacity (and the default when the field is absent,
+# which predates it); SPOT is interruptible.
+_AVAILABILITY_MODEL_LABELS = {
+    AvailabilityModel.STANDARD: "Standard",
+    AvailabilityModel.SPOT: "Spot",
+}
+
+
+def _format_capacity_type(job: dict) -> str:
+    raw = job.get("availability_model") or AvailabilityModel.STANDARD
+    try:
+        model = AvailabilityModel(raw)
+    except ValueError:
+        # Unknown future value: surface it rather than dropping it.
+        return str(raw).title()
+    return _AVAILABILITY_MODEL_LABELS.get(model, model.value.title())
+
+
+def _get_job_by_job_id(remote_provider: BasetenRemote, job_id: str) -> dict:
+    jobs = remote_provider.api.search_training_jobs(job_id=job_id)
+    if not jobs:
+        raise RuntimeError(f"No training job found with ID: {job_id}")
+    return jobs[0]
+
+
+def _get_latest_job(remote_provider: BasetenRemote) -> dict:
+    jobs = remote_provider.api.search_training_jobs(
+        order_by=[{"field": "created_at", "order": "desc"}]
+    )
+    if not jobs:
+        raise click.ClickException("No training jobs found. Please start a job first.")
+    return jobs[0]
+
+
+def get_args_for_stop(
+    remote_provider: BasetenRemote, project_id: Optional[str], job_id: Optional[str]
+) -> Tuple[str, str]:
+    if not project_id or not job_id:
+        # get all running jobs
+        job = _get_active_job(remote_provider, project_id, job_id)
+        project_id_for_job = job["training_project"]["id"]
+        job_id_to_stop = job["id"]
+        # check if the user wants to stop the inferred running job
+        if not job_id:
+            user_email = job.get("user", {}).get("email")
+            user_msg = f" (created by {user_email})" if user_email else ""
+            confirm = inquirer.confirm(
+                message=f"Are you sure you want to stop training job {job_id_to_stop}{user_msg}?",
+                default=False,
+            ).execute()
+            if not confirm:
+                raise click.UsageError("Training job not stopped.")
+        return project_id_for_job, job_id_to_stop
+
+    return project_id, job_id
+
+
+def _get_active_job(
+    remote_provider: BasetenRemote, project_id: Optional[str], job_id: Optional[str]
+) -> dict:
+    jobs = remote_provider.api.search_training_jobs(
+        statuses=QUEUED_JOB_STATUSES + ACTIVE_JOB_STATUSES,
+        project_id=project_id,
+        job_id=job_id,
+    )
+    if not jobs:
+        raise click.UsageError("No queued or running jobs found.")
+    if len(jobs) > 1:
+        display_training_jobs(
+            jobs, remote_provider.remote_url, title="Active Training Jobs"
+        )
+        raise click.UsageError("Multiple active jobs found. Please specify a job id.")
+    return jobs[0]
+
+
+@dataclass
+class DisplayTableColumn:
+    name: str
+    style: dict
+    accessor: Callable[[dict], str]
+
+
+def display_training_jobs(jobs, remote_url: str, title="Training Job Details"):
+    table = rich.table.Table(
+        show_header=True,
+        header_style="bold magenta",
+        title=title,
+        box=rich.table.box.ROUNDED,
+        border_style="blue",
+    )
+    table.add_column("Job ID", style="cyan")
+    table.add_column("Job Name")
+    table.add_column("Project")
+    table.add_column("Status")
+    table.add_column("Instance Type")
+    table.add_column("Capacity Type")
+    table.add_column("Created By")
+    table.add_column("Created")
+    table.add_column("Job Page", style="bold yellow")
+
+    for job in jobs:
+        table.add_row(
+            job["id"],
+            job["name"],
+            job["training_project"]["name"],
+            job["current_status"],
+            job["instance_type"]["name"],
+            _format_capacity_type(job),
+            job.get("user", {}).get("email", ""),
+            cli_common.format_localized_time(job["created_at"]),
+            cli_common.format_link(
+                status_page_url(remote_url, job["training_project"]["id"], job["id"]),
+                "link",
+            ),
+        )
+
+    console.print(table)
+
+
+def recreate_training_job(
+    remote_provider: BasetenRemote, job_id: Optional[str] = None
+) -> Dict[str, Any]:
+    job: dict
+    if job_id:
+        job = _get_job_by_job_id(remote_provider, job_id)
+    else:
+        job = _get_latest_job(remote_provider)
+        job_id = job["id"]
+        confirm = inquirer.confirm(
+            message=f"Recreate training job from most recent job {job_id}?",
+            default=False,
+        ).execute()
+
+        if not confirm:
+            raise click.UsageError("Training job not recreated.")
+
+    project_id = job["training_project"]["id"]
+    job_id = job["id"]
+    job_resp = remote_provider.api.recreate_training_job(project_id, job_id)  # type: ignore
+    return job_resp
+
+
+def update_training_job(
+    remote_provider: BasetenRemote,
+    job_id: str,
+    *,
+    priority: Optional[int] = None,
+    availability_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    if priority is None and availability_model is None:
+        raise ValueError("At least one field to update must be provided.")
+    job = _get_job_by_job_id(remote_provider, job_id)
+    project_id = job["training_project"]["id"]
+    job_id = job["id"]
+    return remote_provider.api.update_training_job(
+        project_id, job_id, priority=priority, availability_model=availability_model
+    )
+
+
+def display_training_projects(projects: list[dict], remote_url: str) -> None:
+    table = rich.table.Table(
+        show_header=True,
+        header_style="bold magenta",
+        title="Training Projects",
+        box=rich.table.box.ROUNDED,
+        border_style="blue",
+    )
+    table.add_column("Project ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Created")
+    table.add_column("Last Modified")
+    table.add_column("Latest Job ID", style="bold yellow")
+    table.add_column("Latest Job Status", style="bold yellow")
+    table.add_column("Checkpoint Sync", style="bold yellow")
+    table.add_column("Status Page", style="bold yellow")
+
+    # most recent projects at bottom of terminal
+    for project in projects[::-1]:
+        latest_job = project.get("latest_job") or {}
+        if latest_job_id := latest_job.get("id", ""):
+            latest_job_link = cli_common.format_link(
+                status_page_url(remote_url, project["id"], latest_job_id), "link"
+            )
+        else:
+            latest_job_link = ""
+        table.add_row(
+            project["id"],
+            project["name"],
+            cli_common.format_localized_time(project["created_at"]),
+            cli_common.format_localized_time(project["updated_at"]),
+            latest_job_id,
+            latest_job.get("current_status", ""),
+            latest_job.get("checkpoint_sync_status", ""),
+            latest_job_link,
+        )
+
+    console.print(table)
+
+
+def display_queued_jobs(jobs: list[dict], remote_url: str) -> None:
+    table = rich.table.Table(
+        show_header=True,
+        header_style="bold magenta",
+        title="Queued Training Jobs",
+        box=rich.table.box.ROUNDED,
+        border_style="blue",
+    )
+    table.add_column("Job ID", style="cyan")
+    table.add_column("Job Name")
+    table.add_column("Project")
+    table.add_column("Instance Type")
+    table.add_column("Capacity Type")
+    table.add_column("Priority")
+    table.add_column("Created By")
+    table.add_column("Queued At")
+    table.add_column("Job Page", style="bold yellow")
+
+    sorted_jobs = sorted(
+        jobs, key=lambda j: (-(j.get("priority") or 0), j.get("created_at", ""))
+    )
+
+    for job in sorted_jobs:
+        table.add_row(
+            job["id"],
+            job["name"],
+            job["training_project"]["name"],
+            job["instance_type"]["name"],
+            _format_capacity_type(job),
+            str(job.get("priority") or 0),
+            job.get("user", {}).get("email", ""),
+            cli_common.format_localized_time(job["created_at"]),
+            cli_common.format_link(
+                status_page_url(remote_url, job["training_project"]["id"], job["id"]),
+                "link",
+            ),
+        )
+
+    console.print(table)
+
+
+def view_training_details(
+    remote_provider: BasetenRemote, project_id: Optional[str], job_id: Optional[str]
+):
+    """
+    view_training_details shows a list of jobs that meet the provided project_id and job_id filters.
+
+     If no filters are provided, the command will show a list of all training projects along with queued and active jobs.
+    """
+    if job_id or project_id:
+        jobs_response = remote_provider.api.search_training_jobs(
+            project_id=project_id,
+            job_id=job_id,
+            order_by=[{"field": "created_at", "order": "asc"}],
+        )
+        if len(jobs_response) == 0:
+            raise click.UsageError("No training jobs found")
+        if len(jobs_response) == 1:
+            training_job = jobs_response[0]
+            checkpoints = remote_provider.api.list_training_job_checkpoints(
+                training_job["training_project"]["id"], training_job["id"]
+            )
+            display_training_job(
+                training_job, remote_provider.remote_url, checkpoints["checkpoints"]
+            )
+        else:
+            display_training_jobs(jobs_response, remote_provider.remote_url)
+    else:
+        projects = remote_provider.api.list_training_projects()
+        display_training_projects(projects, remote_provider.remote_url)
+        jobs = remote_provider.api.search_training_jobs(
+            statuses=QUEUED_JOB_STATUSES + ACTIVE_JOB_STATUSES
+        )
+        queued_jobs = [j for j in jobs if j["current_status"] in QUEUED_JOB_STATUSES]
+        active_jobs = [j for j in jobs if j["current_status"] in ACTIVE_JOB_STATUSES]
+        if queued_jobs:
+            display_queued_jobs(queued_jobs, remote_provider.remote_url)
+        if active_jobs:
+            display_training_jobs(
+                active_jobs, remote_provider.remote_url, title="Active Training Jobs"
+            )
+        if not queued_jobs and not active_jobs:
+            console.print("No queued or active training jobs.", style="yellow")
+
+
+def stop_all_jobs(remote_provider: BasetenRemote, project_id: Optional[str]):
+    active_jobs = remote_provider.api.search_training_jobs(
+        project_id=project_id, statuses=QUEUED_JOB_STATUSES + ACTIVE_JOB_STATUSES
+    )
+    if not active_jobs:
+        console.print("No queued or active jobs found.", style="yellow")
+        return
+    confirm = inquirer.confirm(
+        message=f"Are you sure you want to stop {len(active_jobs)} active jobs?",
+        default=False,
+    ).execute()
+    if not confirm:
+        raise click.UsageError("Training jobs not stopped.")
+    for job in active_jobs:
+        remote_provider.api.stop_training_job(job["training_project"]["id"], job["id"])
+    console.print("Training jobs stopped successfully.", style="green")
+
+
+def view_training_job_metrics(
+    remote_provider: BasetenRemote, project_id: Optional[str], job_id: Optional[str]
+):
+    """
+    view_training_job_metrics shows a list of metrics for a training job.
+    """
+    project_id, job_id = common.get_most_recent_job(remote_provider, project_id, job_id)
+    metrics_display = MetricsWatcher(remote_provider.api, project_id, job_id)
+    metrics_display.watch()
+
+
+def create_model_version_from_inference_template(
+    remote_provider: BasetenRemote, args: DeployCheckpointArgs
+) -> DeploySuccessResult:
+    if args.deploy_config_path and args.checkpoint_ids:
+        raise click.UsageError(
+            "--checkpoint-ids cannot be combined with --config. "
+            "Pick one source of checkpoint identifiers."
+        )
+
+    if args.checkpoint_ids:
+        config = DeployCheckpointsConfig(
+            checkpoint_details=CheckpointList(loops_checkpoint_ids=args.checkpoint_ids)
+        )
+        return deploy_checkpoints.create_model_version_from_inference_template(
+            remote_provider,
+            config,
+            args.project_id,
+            args.job_id,
+            args.run_id,
+            args.dry_run,
+            args.is_loops_command,
+        )
+
+    if not args.deploy_config_path:
+        return deploy_checkpoints.create_model_version_from_inference_template(
+            remote_provider,
+            DeployCheckpointsConfig(),
+            args.project_id,
+            args.job_id,
+            args.run_id,
+            args.dry_run,
+            args.is_loops_command,
+        )
+    # User provided a checkpoint deploy config file
+    with loader.import_deploy_checkpoints_config(
+        Path(args.deploy_config_path)
+    ) as checkpoint_deploy:
+        return deploy_checkpoints.create_model_version_from_inference_template(
+            remote_provider,
+            checkpoint_deploy,
+            args.project_id,
+            args.job_id,
+            args.run_id,
+            args.dry_run,
+            args.is_loops_command,
+        )
+
+
+def write_truss_config(
+    result: DeploySuccessResult, truss_config_output_dir: Optional[str], dry_run: bool
+) -> None:
+    if not result.truss_config:
+        return
+    datestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder_name = (
+        f"{result.model_version.name}_{result.model_version.id}"
+        if result.model_version
+        else f"dry_run_{datestamp}"
+    )
+    output_dir_str = truss_config_output_dir or f"truss_configs/{folder_name}"
+    output_dir = Path(output_dir_str)
+    output_path = output_dir / "config.yaml"
+    os.makedirs(output_dir, exist_ok=True)
+    console.print(f"Writing truss config to {output_path}", style="yellow")
+    console.print(f"👀 Run `cat {output_path}` to view the truss config", style="green")
+    if dry_run:
+        console.print(
+            f"🚀 Run `cd {output_dir} && truss push` to deploy the truss", style="green"
+        )
+    result.truss_config.write_to_yaml_file(output_path)
+
+
+def _get_checkpoint_names(
+    checkpoint_deploy_config: DeployCheckpointsConfigComplete,
+) -> list[str]:
+    return [
+        checkpoint.checkpoint_name
+        for checkpoint in checkpoint_deploy_config.checkpoint_details.checkpoints
+    ]
+
+
+def print_deploy_checkpoints_success_message(
+    checkpoint_deploy_config: DeployCheckpointsConfigComplete,
+):
+    checkpoint_names = _get_checkpoint_names(checkpoint_deploy_config)
+    if not checkpoint_names:
+        # Loops checkpoint deploys reference checkpoints by ID; the client
+        # doesn't know each name without an extra API call. Skip the
+        # name-specific guidance.
+        console.print(
+            Text("\nDeployment succeeded. Set the `model` parameter on each "),
+            Text("request to the Loops checkpoint name (e.g. `step-100`)."),
+        )
+        return
+    console.print(
+        Text("\nTo run the model"),
+        Text("ensure your `model` parameter is set to one of"),
+        Text(
+            f"{[checkpoint_name for checkpoint_name in checkpoint_names]}",
+            style="magenta",
+        ),
+        Text("in your request. An example request body might look like this:"),
+        Text(
+            f'\n{{"model": "{checkpoint_names[0]}", "messages": [...]}}', style="green"
+        ),
+    )
+
+
+def display_training_job(
+    job: dict, remote_url: str, checkpoints: Optional[list[dict]] = None
+):
+    table = rich.table.Table(
+        show_header=False,
+        title=f"Training Job: {job['id']}",
+        box=rich.table.box.ROUNDED,
+        border_style="blue",
+        title_style="bold magenta",
+    )
+    table.add_column("Field", style="bold cyan")
+    table.add_column("Value")
+
+    # Basic job details
+    table.add_row("Job Name", job["name"])
+    table.add_row("Job ID", job["id"])
+    table.add_row("Project ID", job["training_project"]["id"])
+    table.add_row("Project Name", job["training_project"]["name"])
+    table.add_row("Status", job["current_status"])
+    table.add_row("Instance Type", job["instance_type"]["name"])
+    table.add_row("Priority", str(job.get("priority") or 0))
+    table.add_row("Availability Model", _format_capacity_type(job))
+    if user_email := job.get("user", {}).get("email"):
+        table.add_row("Created By", user_email)
+    table.add_row("Created", cli_common.format_localized_time(job["created_at"]))
+    table.add_row("Last Modified", cli_common.format_localized_time(job["updated_at"]))
+    table.add_row(
+        "Job Page",
+        cli_common.format_link(
+            status_page_url(remote_url, job["training_project"]["id"], job["id"]),
+            "link",
+        ),
+    )
+
+    # Add checkpoint sync status if present
+    if job.get("checkpoint_sync_status"):
+        table.add_row("Checkpoint Sync", job["checkpoint_sync_status"])
+
+    # Add error message if present
+    if job.get("error_message"):
+        table.add_row("Error Message", Text(job["error_message"], style="red"))
+
+    # Add checkpoints if present
+    if checkpoints:
+        checkpoint_text = ", ".join(
+            [checkpoint["checkpoint_id"] for checkpoint in checkpoints]
+        )
+        table.add_row("Checkpoints", checkpoint_text)
+
+    console.print(table)
+
+
+def _generate_job_artifact_name(project_name: str, job_id: str) -> str:
+    return f"{project_name}_{job_id}"
+
+
+def download_training_job_data(
+    remote_provider: BasetenRemote,
+    job_id: str,
+    target_directory: Optional[str],
+    unzip: bool,
+) -> Path:
+    output_dir = Path(target_directory).resolve() if target_directory else Path.cwd()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    job = _get_job_by_job_id(remote_provider, job_id)
+
+    project = job["training_project"]
+    project_id = project["id"]
+    project_name = project["name"]
+
+    artifact_base_name = _generate_job_artifact_name(project_name, job_id)
+    file_name = f"{artifact_base_name}.tgz"
+    target_path = output_dir / file_name
+
+    presigned_url = remote_provider.api.get_training_job_presigned_url(
+        project_id=project_id, job_id=job_id
+    )
+    content = remote_provider.api.get_from_presigned_url(presigned_url)
+
+    if unzip:
+        with tempfile.NamedTemporaryFile() as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_path.write_bytes(content)
+
+            unzip_dir = output_dir / artifact_base_name
+            unzip_dir = Path(str(unzip_dir).replace(" ", "-"))
+            if unzip_dir.exists():
+                raise click.ClickException(
+                    f"Directory '{unzip_dir}' already exists. "
+                    "Please remove it or specify a different target directory."
+                )
+
+            unzip_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(temp_path, "r:*") as tar:
+                tar.extractall(path=unzip_dir)
+
+            return unzip_dir
+    else:
+        target_path = Path(str(target_path).replace(" ", "-"))
+        target_path.write_bytes(content)
+        return target_path
+
+
+def download_checkpoint_artifacts(
+    remote_provider: BasetenRemote, job_id: Optional[str]
+) -> Path:
+    output_dir = Path.cwd()
+    job: dict
+
+    if job_id:
+        job = _get_job_by_job_id(remote_provider, job_id)
+    else:
+        job = _get_latest_job(remote_provider)
+
+    job_id = job["id"]
+    project = job["training_project"]
+    project_id = project["id"]
+    project_name = project["name"]
+
+    checkpoint_artifacts = (
+        remote_provider.api.get_training_job_checkpoint_presigned_url(
+            project_id=project_id,
+            job_id=job_id,  # type: ignore
+            page_size=1000,
+        )
+    )
+
+    if not checkpoint_artifacts:
+        raise click.ClickException("No checkpoints found for this training job.")
+
+    output = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "job": job,
+        "checkpoint_artifacts": checkpoint_artifacts,
+    }
+
+    urls_file = (
+        output_dir / f"{project_name.replace(' ', '-')}_{job_id}_checkpoints.json"
+    )
+    with open(urls_file, "w") as f:
+        json.dump(output, f, indent=2)
+
+    return urls_file
+
+
+def status_page_url(remote_url: str, project_id: str, training_job_id: str) -> str:
+    return f"{remote_url}/training/{project_id}/logs/{training_job_id}"
+
+
+EXAMPLES_INDEX_FILE = ".examples-index.json"
+
+
+def _fetch_examples_index(
+    repo_id: str = "ml-cookbook", token: Optional[str] = None
+) -> Optional[Dict[str, Dict[str, str]]]:
+    """
+    Fetch the repository's examples index, which maps each example name to the
+    directory to download (``{"examples": {name: {"path": ...}}}``). Returns None
+    when the repository has no usable index, so callers fall back to listing
+    the examples directory.
+    """
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    url = f"https://raw.githubusercontent.com/basetenlabs/{repo_id}/main/{EXAMPLES_INDEX_FILE}"
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        index = response.json()
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+    if (
+        not isinstance(index, dict)
+        or index.get("version") != 1
+        or not isinstance(index.get("examples"), dict)
+    ):
+        return None
+    return index["examples"]
+
+
+def _get_all_train_init_example_options(
+    repo_id: str = "ml-cookbook",
+    examples_subdir: str = "examples",
+    token: Optional[str] = None,
+) -> list[str]:
+    """
+    Retrieve a list of all example options from the ml-cookbook repository to
+    copy locally for training initialization. This method generates a list
+    of examples and URL paths to show the user for selection.
+    """
+    index = _fetch_examples_index(repo_id=repo_id, token=token)
+    if index is not None:
+        return sorted(index)
+
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    url = (
+        f"https://api.github.com/repos/basetenlabs/{repo_id}/contents/{examples_subdir}"
+    )
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        items = response.json()
+        if not isinstance(items, list):
+            items = [items]
+        items = [item["name"] for item in items if item["type"] == "dir"]
+        return items
+
+    except requests.exceptions.RequestException as e:
+        click.echo(
+            f"Error exploring directory: {e}. Please file an issue at https://github.com/basetenlabs/truss/issues"
+        )
+        return []
+
+
+def _get_train_init_example_info(
+    repo_id: str = "ml-cookbook",
+    examples_subdir: str = "examples",
+    training_subdir: str = "training",
+    example_name: Optional[str] = None,
+    token: Optional[str] = None,
+) -> list[Dict[str, str]]:
+    """
+    Retrieve directory download links for the example from the ml-cookbook repository to
+    copy locally for training initialization.
+    """
+    index = _fetch_examples_index(repo_id=repo_id, token=token)
+    if index is not None:
+        entry = index.get(example_name) if example_name else None
+        if not entry or not entry.get("path"):
+            return []
+        path = entry["path"].strip("/")
+        return [
+            {
+                "name": path.rsplit("/", 1)[-1],
+                "type": "dir",
+                "url": f"https://api.github.com/repos/basetenlabs/{repo_id}/contents/{path}",
+            }
+        ]
+
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    url = f"https://api.github.com/repos/basetenlabs/{repo_id}/contents/{examples_subdir}/{example_name}"
+
+    console.print(f"Attempting to retrieve example info from: {url}")
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        items = response.json()
+        if not isinstance(items, list):
+            items = [items]
+        # return only training subdirectory info for example
+        items = [item for item in items if item["name"] == training_subdir]
+        return items
+
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 404:
+            # example_name does not exist, return empty list
+            return []
+        else:
+            # Other HTTP errors
+            click.echo(
+                f"Error exploring directory: {e}. Please file an issue at https://github.com/basetenlabs/truss/issues"
+            )
+            return []
+    except requests.exceptions.RequestException as e:
+        # Network or other request errors
+        click.echo(
+            f"Error exploring directory: {e}. Please file an issue at https://github.com/basetenlabs/truss/issues"
+        )
+        return []
+
+
+def download_git_directory(
+    git_api_url: str, local_dir: str, token: Optional[str] = None
+):
+    """
+    Recursively download directory contents from git api url.
+    Special handling for 'training' directory: downloads its contents directly
+    to local_dir without creating a 'training' subdirectory.
+    Args:
+        git_api_url (str): Example format "https://api.github.com/repos/basetenlabs/ml-cookbook/contents/examples/llama-finetune-8b-lora?ref=main"
+        local_dir(str): Local directory to download this directory to
+    """
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    try:
+        response = requests.get(git_api_url, headers=headers)
+        response.raise_for_status()
+        items = response.json()
+
+        # Handle single file case
+        if not isinstance(items, list):
+            items = [items]
+
+        # Create local directory
+        print(f"Creating directory {local_dir}")
+        os.makedirs(local_dir, exist_ok=True)
+
+        # Check if there's a 'training' directory in the items
+        training_dir = None
+        other_items = []
+
+        for item in items:
+            if item["name"] == "training" and item["type"] == "dir":
+                training_dir = item
+            else:
+                other_items.append(item)
+
+        # If training directory exists, download its contents directly to local_dir
+        if training_dir:
+            print(
+                f"📁 Found training directory, downloading its contents to {local_dir}"
+            )
+            return download_git_directory(training_dir["url"], local_dir)
+
+        # If no training directory, download all files normally
+        for item in other_items:
+            item_name = item["name"]
+            local_item_path = os.path.join(local_dir, item_name)
+
+            if item["type"] == "file":
+                print(f"📄 Downloading {item_name}")
+                if item.get("download_url"):
+                    # Download file directly
+                    file_response = requests.get(item["download_url"])
+                    file_response.raise_for_status()
+                    with open(local_item_path, "wb") as f:
+                        f.write(file_response.content)
+                elif item.get("content"):
+                    # Decode base64 content (for small files)
+                    try:
+                        content = base64.b64decode(item["content"])
+                        with open(local_item_path, "wb") as f:
+                            f.write(content)
+                    except Exception as e:
+                        print(f"⚠️ Could not decode {item_name}: {e}")
+            elif item["type"] == "dir":
+                print(f"📁 Entering directory {item_name}")
+                # Use the API URL from the response for subdirectories
+                download_git_directory(item["url"], local_item_path)
+        return True
+    except Exception as e:
+        print(f"Error processing response: {e}")
+        return False
+
+
+def fetch_project_by_name_or_id(
+    remote_provider: BasetenRemote, project_identifier: str
+) -> dict:
+    """Fetch a training project by name or ID.
+
+    Args:
+        remote_provider: The remote provider instance
+        project_identifier: Either a project ID or project name
+
+    Returns:
+        The project object as a dictionary
+
+    Raises:
+        click.ClickException: If the project is not found
+    """
+    try:
+        projects = remote_provider.api.list_training_projects()
+        projects_by_name = {project.get("name"): project for project in projects}
+        projects_by_id = {project.get("id"): project for project in projects}
+        if project_identifier in projects_by_id:
+            return projects_by_id[project_identifier]
+        if project_identifier in projects_by_name:
+            return projects_by_name[project_identifier]
+        valid_project_ids_and_names = ", ".join(
+            [f"{project.get('id')} ({project.get('name')})" for project in projects]
+        )
+        raise click.ClickException(
+            f"Project '{project_identifier}' not found. Valid project IDs and names: {valid_project_ids_and_names}"
+        )
+    except click.ClickException:
+        raise
+    except Exception as e:
+        raise click.ClickException(f"Error fetching project: {str(e)}")
+
+
+def view_cache_summary_by_project(
+    remote_provider: BasetenRemote,
+    project_identifier: str,
+    sort_by: Optional[str] = None,
+    order: Optional[str] = None,
+    output_format: Optional[str] = None,
+):
+    """View cache summary for a training project by ID or name."""
+    from truss.cli.train.cache import (
+        OUTPUT_FORMAT_CLI_TABLE,
+        SORT_BY_FILEPATH,
+        SORT_ORDER_ASC,
+        view_cache_summary,
+    )
+
+    # Use constants for defaults if not provided
+    if sort_by is None:
+        sort_by = SORT_BY_FILEPATH
+    if order is None:
+        order = SORT_ORDER_ASC
+    if output_format is None:
+        output_format = OUTPUT_FORMAT_CLI_TABLE
+
+    project = fetch_project_by_name_or_id(remote_provider, project_identifier)
+    view_cache_summary(remote_provider, project["id"], sort_by, order, output_format)
+
+
+def _usage_split(item: dict) -> Tuple[str, str]:
+    """Return (standard, spot) usage cells for a capacity item.
+
+    The backend splits usage_count into standard and spot. A pre-split backend
+    omits the breakdown; fall back to showing the total under standard so the
+    column still reflects real usage.
+    """
+    standard = item.get("dedicated_usage_count")
+    spot = item.get("spot_usage_count")
+    if standard is None and spot is None:
+        return str(item.get("usage_count", 0)), "0"
+    return str(standard or 0), str(spot or 0)
+
+
+def display_training_capacity(remote_provider: BasetenRemote) -> None:
+    """Fetch and display org- and team-level GPU capacity limits and usage."""
+    capacity = remote_provider.api.get_training_capacity()
+    gpu_capacities = capacity.get("gpu_capacities", [])
+    team_gpu_capacities = capacity.get("team_gpu_capacities", [])
+
+    if not gpu_capacities and not team_gpu_capacities:
+        console.print("No Training GPU capacity limits.")
+        return
+
+    if gpu_capacities:
+        org_table = rich.table.Table(
+            show_header=True,
+            header_style="bold magenta",
+            title="Training GPU Capacity",
+            box=rich.table.box.ROUNDED,
+            border_style="blue",
+        )
+        org_table.add_column("GPU Type", style="cyan")
+        org_table.add_column("Baseline", justify="right")
+        org_table.add_column("Limit", justify="right")
+        org_table.add_column("Standard", justify="right")
+        org_table.add_column("Spot", justify="right")
+        for item in gpu_capacities:
+            on_demand, spot = _usage_split(item)
+            org_table.add_row(
+                item.get("gpu_type", ""),
+                str(item.get("baseline", 0)),
+                str(item.get("limit", 0)),
+                on_demand,
+                spot,
+            )
+        console.print(org_table)
+
+    if team_gpu_capacities:
+        team_table = rich.table.Table(
+            show_header=True,
+            header_style="bold magenta",
+            title="Team Training GPU Capacity",
+            box=rich.table.box.ROUNDED,
+            border_style="blue",
+        )
+        team_table.add_column("Team", style="cyan")
+        team_table.add_column("GPU Type", style="cyan")
+        team_table.add_column("Limit", justify="right")
+        team_table.add_column("Standard", justify="right")
+        team_table.add_column("Spot", justify="right")
+        for item in team_gpu_capacities:
+            on_demand, spot = _usage_split(item)
+            team_table.add_row(
+                item.get("team_name", ""),
+                item.get("gpu_type", ""),
+                str(item.get("limit", 0)),
+                on_demand,
+                spot,
+            )
+        console.print(team_table)
+
+
+def update_team_training_gpu_capacity(
+    remote_provider: BasetenRemote, team_name: str, gpu_type: str, capacity: int
+) -> Dict[str, Any]:
+    """Set the max concurrent GPUs of a given type a team may use. Org-admin only."""
+    existing_teams = remote_provider.api.get_teams()
+    team = existing_teams.get(team_name)
+    if team is None:
+        raise click.ClickException(
+            f"Team '{team_name}' does not exist. "
+            f"Available teams: {remote_cli.format_available_teams(existing_teams)}"
+        )
+    return remote_provider.api.update_team_training_gpu_capacity(
+        team_id=team.id, gpu_type=gpu_type, max_gpus=capacity
+    )

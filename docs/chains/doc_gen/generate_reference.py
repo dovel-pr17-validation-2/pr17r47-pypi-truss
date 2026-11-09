@@ -1,0 +1,269 @@
+# type: ignore  # This tool is only for Marius.
+"""Script to auto-generate the API reference for Truss Chains."""
+
+import argparse
+import inspect
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from sphinx import application
+
+import truss_chains as chains
+
+DUMMY_INDEX_RST = """
+.. Dummy
+
+Welcome to Truss Chains's documentation!
+========================================
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Contents:
+
+   modules
+"""
+
+
+BUILDER = "mdx_adapter"  # "mdx_adapter" "html" "markdown"
+NON_PUBLIC_SYMBOLS = [
+    "truss_chains.deployment.deployment_client.ChainService",
+    "truss_chains.remote_chainlet.truss_chainlet.TrussHandle",
+]
+
+
+SECTION_CHAINLET = (
+    "Chainlet classes",
+    "APIs for creating user-defined Chainlets.",
+    [
+        "truss_chains.ChainletBase",
+        "truss_chains.TrussChainlet",
+        "truss_chains.ModelBase",
+        "truss_chains.EngineBuilderLLMChainlet",
+        "truss_chains.depends",
+        "truss_chains.depends_context",
+        "truss_chains.DeploymentContext",
+        "truss_chains.Environment",
+        "truss_chains.ChainletOptions",
+        "truss_chains.RPCOptions",
+        "truss_chains.mark_entrypoint",
+    ],
+)
+SECTION_CONFIG = (
+    "Remote Configuration",
+    (
+        "These data structures specify for each chainlet how it gets deployed "
+        "remotely, for example, dependencies and compute resources."
+    ),
+    [
+        "truss_chains.RemoteConfig",
+        "truss_chains.DockerImage",
+        "truss_chains.BasetenImage",
+        "truss_chains.CustomImage",
+        "truss_chains.Compute",
+        "truss_chains.Assets",
+    ],
+)
+SECTION_UTILITIES = (
+    "Core",
+    "General framework and helper functions.",
+    [
+        "truss_chains.push",
+        "truss_chains.deployment.deployment_client.ChainService",
+        "truss_chains.make_abs_path_here",
+        "truss_chains.run_local",
+        "truss_chains.DeployedServiceDescriptor",
+        "truss_chains.StubBase",
+        "truss_chains.remote_chainlet.truss_chainlet.TrussHandle",
+        "truss_chains.RemoteErrorDetail",
+        "truss_chains.GenericRemoteException",
+    ],
+)
+
+UNDOCUMENTED = [
+    "truss_chains.WebSocketProtocol",
+    "truss_chains.EngineBuilderLLMInput",
+    "truss_chains.WeightsSource",
+]
+
+SECTIONS = [SECTION_CHAINLET, SECTION_CONFIG, SECTION_UTILITIES]
+
+
+def _list_imported_symbols(module: object) -> dict[str, str]:
+    imported_symbols = {
+        f"truss_chains.{name}": (
+            "autoclass"
+            if inspect.isclass(obj)
+            else "autofunction"
+            if inspect.isfunction(obj)
+            else "autodata"
+        )
+        for name, obj in inspect.getmembers(module)
+        if not name.startswith("_") and not inspect.ismodule(obj)
+    }
+    # Extra classes that are not really exported as public API, but are still relevant.
+    imported_symbols.update({sym: "autoclass" for sym in NON_PUBLIC_SYMBOLS})
+    return imported_symbols
+
+
+def _make_rst_structure(chains):
+    exported_symbols = _list_imported_symbols(chains)
+    rst_parts = []
+    for name, descr, symbols in SECTIONS:
+        rst_parts.append(name)
+        rst_parts.append("=" * len(rst_parts[-1]) + "\n")
+        rst_parts.append(descr)
+        rst_parts.append("\n")
+
+        for symbol in symbols:
+            kind = exported_symbols.pop(symbol)
+            rst_parts.append(f".. {kind}:: {symbol}")
+            rst_parts.append("\n")
+
+    for undoc in UNDOCUMENTED:
+        exported_symbols.pop(undoc)
+
+    if exported_symbols:
+        raise ValueError(
+            "All symbols must be mapped to a section. Left over:"
+            f"{list(exported_symbols.keys())}."
+        )
+    return "\n".join(rst_parts)
+
+
+def _clean_build_directory(build_dir: Path) -> None:
+    if build_dir.exists() and build_dir.is_dir():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _apply_patch(
+    original_file_path: str, patch_file_path: str, output_file_path: str
+) -> None:
+    original_file = Path(original_file_path)
+    patch_file = Path(patch_file_path)
+    output_file = Path(output_file_path)
+
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        temp_output_file_path = Path(temp_file.name)
+
+    try:
+        subprocess.run(
+            [
+                "patch",
+                "--batch",
+                str(original_file),
+                "-o",
+                str(temp_output_file_path),
+                str(patch_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # Copy temp file to final output if no errors
+        shutil.copy(temp_output_file_path, output_file)
+
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            "Chains reference curation failed; update reference.patch before regenerating."
+        ) from error
+
+    finally:
+        if temp_output_file_path.exists():
+            temp_output_file_path.unlink()
+        reject_file_path = Path(str(temp_output_file_path) + ".rej")
+        if reject_file_path.exists():
+            reject_file_path.unlink()
+
+
+def _resolve_raw_out(raw_out: pathlib.Path | None) -> pathlib.Path | None:
+    if raw_out is None:
+        return None
+    raw_out = raw_out.resolve()
+    if raw_out in {
+        Path(__file__).with_name(name).resolve()
+        for name in ["generated-reference.mdx", "API-reference.mdx"]
+    }:
+        raise ValueError("--raw-out must point to a scratch file")
+    raw_out.parent.mkdir(parents=True, exist_ok=True)
+    return raw_out
+
+
+def generate_sphinx_docs(
+    output_dir: pathlib.Path, *, check: bool = False, raw_out: Path | None = None
+) -> None:
+    if check and raw_out is not None:
+        raise ValueError("--check and --raw-out are mutually exclusive")
+    raw_out = _resolve_raw_out(raw_out)
+    _clean_build_directory(output_dir)
+    config_file = pathlib.Path(__file__).parent / "sphinx_config.py"
+    docs_dir = output_dir / "docs"
+    conf_dir = docs_dir
+    doctree_dir = docs_dir / "doctrees"
+
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "conf.py").write_text(config_file.read_text())
+    (docs_dir / "index.rst").write_text(DUMMY_INDEX_RST)
+    (docs_dir / "modules.rst").write_text(_make_rst_structure(chains))
+
+    app = application.Sphinx(
+        srcdir=str(docs_dir),
+        confdir=str(conf_dir),
+        outdir=str(Path(output_dir).resolve()),
+        doctreedir=str(doctree_dir),
+        buildername=BUILDER,
+    )
+    app.build()
+    if BUILDER == "mdx_adapter":
+        if raw_out is not None:
+            shutil.copy(output_dir / "modules.mdx", raw_out)
+            return
+        dog_gen_dir = pathlib.Path(__file__).parent.absolute()
+        with tempfile.TemporaryDirectory(prefix="chains-reference-") as directory:
+            staged = Path(directory)
+            generated_reference_path = staged / "generated-reference.mdx"
+            shutil.copy(output_dir / "modules.mdx", generated_reference_path)
+            patched_reference_path = staged / "API-reference.mdx"
+            _apply_patch(
+                str(generated_reference_path),
+                str(dog_gen_dir / "reference.patch"),
+                str(patched_reference_path),
+            )
+            references = [generated_reference_path, patched_reference_path]
+            if check:
+                drift = [
+                    path.name
+                    for path in references
+                    if not (dog_gen_dir / path.name).exists()
+                    or path.read_bytes() != (dog_gen_dir / path.name).read_bytes()
+                ]
+                if drift:
+                    raise RuntimeError("Chains reference differs: " + ", ".join(drift))
+            else:
+                for path in references:
+                    shutil.copy(path, dog_gen_dir / path.name)
+
+
+if __name__ == "__main__":
+    # The mdx_adapter sphinx extension lives next to this script; make it
+    # importable regardless of the CWD the script is invoked from.
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check", action="store_true", help="Compare without writing references"
+    )
+    parser.add_argument(
+        "--raw-out", type=Path, help="Export uncurated MDX without replacing references"
+    )
+    args = parser.parse_args()
+    if args.check and args.raw_out:
+        parser.error("--check and --raw-out are mutually exclusive")
+    with tempfile.TemporaryDirectory(prefix="chains-docgen-") as directory:
+        generate_sphinx_docs(
+            output_dir=pathlib.Path(directory), check=args.check, raw_out=args.raw_out
+        )

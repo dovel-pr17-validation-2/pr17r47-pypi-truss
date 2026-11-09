@@ -1,0 +1,1464 @@
+import base64
+import json
+import logging
+from enum import Enum
+from typing import Any, Dict, List, Mapping, Optional
+
+import requests
+from pydantic import BaseModel, Field
+
+from truss.base.custom_types import SafeModel
+from truss.remote.baseten import custom_types as b10_types
+from truss.remote.baseten.auth import AuthService
+from truss.remote.baseten.custom_types import APIKeyCategory, TeamType
+from truss.remote.baseten.error import ApiError
+from truss.remote.baseten.rest_client import RestAPIClient
+from truss.remote.baseten.user_agent import with_user_agent
+from truss.remote.baseten.utils.transfer import base64_encoded_json_str
+
+logger = logging.getLogger(__name__)
+PARAMS_INDENT = "\n                    "
+
+
+class ChainAWSCredential(SafeModel):
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str
+
+
+class ChainUploadCredentials(SafeModel):
+    s3_bucket: str
+    s3_key: str
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str
+
+    @property
+    def aws_credentials(self) -> ChainAWSCredential:
+        return ChainAWSCredential(
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+
+
+class InstanceTypeV1(BaseModel):
+    """An instance type."""
+
+    id: str = Field(description="Identifier string for the instance type")
+    name: str = Field(description="Name of the instance type")
+    display_name: str = Field(
+        alias="displayName", description="Display name of the instance type"
+    )
+    gpu_count: int = Field(
+        alias="gpuCount", description="Number of GPUs on the instance type"
+    )
+    default: bool = Field(description="Whether this is the default instance type")
+    gpu_memory: Optional[int] = Field(alias="gpuMemory", description="GPU memory in MB")
+    node_count: int = Field(alias="nodeCount", description="Number of nodes")
+    gpu_type: Optional[str] = Field(
+        alias="gpuType", description="Type of GPU on the instance type"
+    )
+    millicpu_limit: int = Field(
+        alias="millicpuLimit", description="CPU limit of the instance type in millicpu"
+    )
+    memory_limit: int = Field(
+        alias="memoryLimit", description="Memory limit of the instance type in MB"
+    )
+    price: Optional[float] = Field(description="Price of the instance type")
+    limited_capacity: Optional[bool] = Field(
+        alias="limitedCapacity",
+        description="Whether this instance type has limited capacity",
+    )
+
+    class Config:
+        populate_by_name = True
+
+
+API_URL_MAPPING = {
+    "https://app.baseten.co": "https://api.baseten.co",
+    "https://app.staging.baseten.co": "https://api.staging.baseten.co",
+    "https://app.dev.baseten.co": "https://api.mc-dev.baseten.co",
+    # For local development, this is how we map URLs
+    "http://localhost:8000": "http://api.localhost:8000",
+}
+
+# If a non-standard domain is used with the baseten remote, default to
+# using the production api routes
+DEFAULT_API_DOMAIN = "https://api.baseten.co"
+
+
+def resolve_rest_api_url(remote_url: str) -> str:
+    """Map an app remote_url (e.g. https://app.baseten.co) to its REST API base."""
+    return API_URL_MAPPING.get(remote_url.strip("/"), DEFAULT_API_DOMAIN)
+
+
+def _oracle_data_to_graphql_mutation(oracle: b10_types.OracleData) -> str:
+    args = [
+        f'model_name: "{oracle.model_name}"',
+        f's3_key: "{oracle.s3_key}"',
+        f'encoded_config_str: "{oracle.encoded_config_str}"',
+    ]
+
+    if oracle.semver_bump:
+        args.append(f'semver_bump: "{oracle.semver_bump}"')
+
+    if oracle.version_name:
+        args.append(f'version_name: "{oracle.version_name}"')
+
+    args_str = ",\n".join(args)
+
+    return f"""{{
+        {args_str}
+    }}"""
+
+
+def _chainlet_data_atomic_to_graphql_mutation(
+    chainlet: b10_types.ChainletDataAtomic,
+) -> str:
+    oracle_data_string = _oracle_data_to_graphql_mutation(chainlet.oracle)
+    args = [f'name: "{chainlet.name}"', f"oracle: {oracle_data_string}"]
+    args_str = ",\n".join(args)
+    return f"""{{
+        {args_str}
+    }}"""
+
+
+class BasetenApi:
+    _rest_api_client: RestAPIClient
+
+    class GraphQLErrorCodes(Enum):
+        RESOURCE_NOT_FOUND = "RESOURCE_NOT_FOUND"
+
+    def __init__(self, remote_url: str, auth_service: AuthService) -> None:
+        graphql_api_url = f"{remote_url}/graphql/"
+        rest_api_url = resolve_rest_api_url(remote_url)
+
+        self._remote_url = remote_url
+        self._graphql_api_url = graphql_api_url
+        self._rest_api_url = rest_api_url
+        self._auth_service = auth_service
+        self._rest_api_client = RestAPIClient(
+            base_url=self._rest_api_url,
+            header_provider=self._auth_service.fetch_auth_header,
+        )
+
+    @property
+    def app_url(self) -> str:
+        return self._remote_url
+
+    @property
+    def rest_api_url(self) -> str:
+        return self._rest_api_url
+
+    @property
+    def suppress_error_print(self) -> bool:
+        return self._rest_api_client.suppress_error_print
+
+    @suppress_error_print.setter
+    def suppress_error_print(self, value: bool) -> None:
+        self._rest_api_client.suppress_error_print = value
+
+    def _post_graphql_query(self, query: str, variables: Optional[dict] = None) -> dict:
+        headers = with_user_agent(self._auth_service.fetch_auth_header())
+        payload: Dict[str, Any] = {"query": query}
+        if variables is not None:
+            payload["variables"] = variables
+
+        resp = requests.post(
+            self._graphql_api_url, json=payload, headers=headers, timeout=120
+        )
+
+        if not resp.ok:
+            logger.error(f"GraphQL endpoint failed with error: {str(resp.content)}")
+            resp.raise_for_status()
+
+        resp_dict = resp.json()
+        errors = resp_dict.get("errors")
+
+        if errors:
+            message = errors[0]["message"]
+            error_code = errors[0].get("extensions", {}).get("code")
+            if errors[0].get("extensions", {}).get("description") is not None:
+                message = errors[0].get("extensions", {}).get("description")
+            raise ApiError(message, error_code)
+
+        return resp_dict
+
+    def model_s3_upload_credentials(self):
+        query_string = """
+        {
+            model_s3_upload_credentials {
+                s3_bucket
+                s3_key
+                aws_access_key_id
+                aws_secret_access_key
+                aws_session_token
+            }
+        }
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]["model_s3_upload_credentials"]
+
+    def create_model_from_truss(
+        self,
+        model_name: str,
+        s3_key: str,
+        config: str,
+        semver_bump: str,
+        truss_user_env: b10_types.TrussUserEnv,
+        allow_truss_download: bool = True,
+        deployment_name: Optional[str] = None,
+        origin: Optional[b10_types.ModelOrigin] = None,
+        environment: Optional[str] = None,
+        deploy_timeout_minutes: Optional[int] = None,
+        team_id: Optional[str] = None,
+        labels: Optional[dict] = None,
+        raw_config: Optional[bytes] = None,
+    ):
+        query_string = f"""
+            mutation ($trussUserEnv: String, $userDeployMetadata: JSONString, $rawConfig: String) {{
+                create_model_from_truss(
+                    name: "{model_name}"
+                    s3_key: "{s3_key}"
+                    config: "{config}"
+                    semver_bump: "{semver_bump}"
+                    truss_user_env: $trussUserEnv
+                    allow_truss_download: {"true" if allow_truss_download else "false"}
+                    {f'version_name: "{deployment_name}"' if deployment_name else ""}
+                    {f"model_origin: {origin.value}" if origin else ""}
+                    {f'environment_name: "{environment}"' if environment else ""}
+                    {f"deploy_timeout_minutes: {deploy_timeout_minutes}" if deploy_timeout_minutes is not None else ""}
+                    {f'team_id: "{team_id}"' if team_id else ""}
+                    user_deploy_metadata: $userDeployMetadata
+                    raw_config: $rawConfig
+                ) {{
+                    model_version {{
+                        id
+                        oracle {{
+                            id
+                            name
+                            hostname
+                        }}
+                        instance_type {{
+                            name
+                        }}
+                    }}
+                }}
+            }}
+        """
+        resp = self._post_graphql_query(
+            query_string,
+            variables={
+                "trussUserEnv": truss_user_env.json(),
+                "userDeployMetadata": json.dumps(labels)
+                if labels is not None
+                else None,
+                "rawConfig": base64.b64encode(raw_config).decode("utf-8")
+                if raw_config is not None
+                else None,
+            },
+        )
+        return resp["data"]["create_model_from_truss"]["model_version"]
+
+    def create_model_version_from_truss(
+        self,
+        model_id: str,
+        s3_key: str,
+        config: str,
+        semver_bump: str,
+        truss_user_env: b10_types.TrussUserEnv,
+        preserve_previous_prod_deployment: bool = False,
+        deployment_name: Optional[str] = None,
+        environment: Optional[str] = None,
+        preserve_env_instance_type: bool = True,
+        deploy_timeout_minutes: Optional[int] = None,
+        labels: Optional[dict] = None,
+        raw_config: Optional[bytes] = None,
+    ):
+        query_string = f"""
+            mutation ($trussUserEnv: String, $userDeployMetadata: JSONString, $rawConfig: String) {{
+                create_model_version_from_truss(
+                    model_id: "{model_id}"
+                    s3_key: "{s3_key}"
+                    config: "{config}"
+                    semver_bump: "{semver_bump}"
+                    truss_user_env: $trussUserEnv
+                    scale_down_old_production: {"false" if preserve_previous_prod_deployment else "true"}
+                    preserve_env_instance_type: {"true" if preserve_env_instance_type else "false"}
+                    {f'name: "{deployment_name}"' if deployment_name else ""}
+                    {f'environment_name: "{environment}"' if environment else ""}
+                    {f"deploy_timeout_minutes: {deploy_timeout_minutes}" if deploy_timeout_minutes is not None else ""}
+                    user_deploy_metadata: $userDeployMetadata
+                    raw_config: $rawConfig
+                ) {{
+                    model_version {{
+                        id
+                        oracle {{
+                            id
+                            name
+                            hostname
+                        }}
+                        instance_type {{
+                            name
+                        }}
+                    }}
+                }}
+            }}
+        """
+
+        resp = self._post_graphql_query(
+            query_string,
+            variables={
+                "trussUserEnv": truss_user_env.json(),
+                "userDeployMetadata": json.dumps(labels)
+                if labels is not None
+                else None,
+                "rawConfig": base64.b64encode(raw_config).decode("utf-8")
+                if raw_config is not None
+                else None,
+            },
+        )
+        return resp["data"]["create_model_version_from_truss"]["model_version"]
+
+    def create_development_model_from_truss(
+        self,
+        model_name,
+        s3_key,
+        config,
+        truss_user_env: b10_types.TrussUserEnv,
+        allow_truss_download=True,
+        origin: Optional[b10_types.ModelOrigin] = None,
+        deploy_timeout_minutes: Optional[int] = None,
+        team_id: Optional[str] = None,
+        labels: Optional[dict] = None,
+        raw_config: Optional[bytes] = None,
+    ):
+        query_string = f"""
+            mutation ($trussUserEnv: String, $userDeployMetadata: JSONString, $rawConfig: String) {{
+                deploy_draft_truss(name: "{model_name}"
+                    s3_key: "{s3_key}"
+                    config: "{config}"
+                    truss_user_env: $trussUserEnv
+                    allow_truss_download: {"true" if allow_truss_download else "false"}
+                    {f"model_origin: {origin.value}" if origin else ""}
+                    {f"deploy_timeout_minutes: {deploy_timeout_minutes}" if deploy_timeout_minutes is not None else ""}
+                    {f'team_id: "{team_id}"' if team_id else ""}
+                    user_deploy_metadata: $userDeployMetadata
+                    raw_config: $rawConfig
+                ) {{
+                    model_version {{
+                        id
+                        oracle {{
+                            id
+                            name
+                            hostname
+                        }}
+                        instance_type {{
+                            name
+                        }}
+                    }}
+                }}
+            }}
+        """
+
+        resp = self._post_graphql_query(
+            query_string,
+            variables={
+                "trussUserEnv": truss_user_env.json(),
+                "userDeployMetadata": json.dumps(labels)
+                if labels is not None
+                else None,
+                "rawConfig": base64.b64encode(raw_config).decode("utf-8")
+                if raw_config is not None
+                else None,
+            },
+        )
+        return resp["data"]["deploy_draft_truss"]["model_version"]
+
+    def deploy_chain_atomic(
+        self,
+        entrypoint: b10_types.ChainletDataAtomic,
+        dependencies: List[b10_types.ChainletDataAtomic],
+        truss_user_env: b10_types.TrussUserEnv,
+        chain_id: Optional[str] = None,
+        chain_name: Optional[str] = None,
+        environment: Optional[str] = None,
+        is_draft: bool = False,
+        original_source_artifact_s3_key: Optional[str] = None,
+        allow_truss_download: Optional[bool] = True,
+        deployment_name: Optional[str] = None,
+        team_id: Optional[str] = None,
+    ):
+        if allow_truss_download is None:
+            allow_truss_download = True
+        entrypoint_str = _chainlet_data_atomic_to_graphql_mutation(entrypoint)
+
+        dependencies_str = ", ".join(
+            [
+                _chainlet_data_atomic_to_graphql_mutation(dependency)
+                for dependency in dependencies
+            ]
+        )
+
+        params = []
+        if chain_id:
+            params.append(f'chain_id: "{chain_id}"')
+        if chain_name:
+            params.append(f'chain_name: "{chain_name}"')
+        if environment:
+            params.append(f'environment: "{environment}"')
+        if original_source_artifact_s3_key:
+            params.append(
+                f'original_source_artifact_s3_key: "{original_source_artifact_s3_key}"'
+            )
+        if team_id:
+            params.append(f'team_id: "{team_id}"')
+
+        params.append(f"is_draft: {str(is_draft).lower()}")
+        if allow_truss_download is False:
+            params.append("allow_truss_download: false")
+        if deployment_name:
+            params.append(f'deployment_name: "{deployment_name}"')
+
+        params_str = PARAMS_INDENT.join(params)
+
+        query_string = f"""
+            mutation ($trussUserEnv: String) {{
+                deploy_chain_atomic(
+                    {params_str}
+                    entrypoint: {entrypoint_str}
+                    dependencies: [{dependencies_str}]
+                    truss_user_env: $trussUserEnv
+                ) {{
+                    chain_deployment {{
+                        id
+                        chain {{
+                            id
+                            hostname
+                        }}
+                    }}
+                }}
+            }}
+        """
+
+        resp = self._post_graphql_query(
+            query_string, variables={"trussUserEnv": truss_user_env.json()}
+        )
+
+        return resp["data"]["deploy_chain_atomic"]
+
+    def get_chains(self, team_id: Optional[str] = None):
+        if team_id:
+            query_string = f"""
+            {{
+                chains(team_id: "{team_id}") {{
+                    id
+                    name
+                    team {{
+                        id
+                        name
+                    }}
+                }}
+            }}
+            """
+        else:
+            query_string = """
+            {
+                chains(all: true) {
+                    id
+                    name
+                    team {
+                        id
+                        name
+                    }
+                }
+            }
+            """
+
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]["chains"]
+
+    def get_chain_deployments(self, chain_id: str):
+        query_string = f"""
+        {{
+          chain(id: "{chain_id}") {{
+            deployments {{
+              id
+              created
+              is_draft
+            }}
+          }}
+        }}
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]["chain"]["deployments"]
+
+    def get_chainlets_by_deployment_id(self, chain_deployment_id: str):
+        query_string = f"""
+        {{
+            chain_deployment(id:"{chain_deployment_id}") {{
+                chainlets {{
+                    name
+                    id
+                    is_entrypoint
+                    oracle {{
+                        id
+                        name
+                        hostname
+                    }}
+                    oracle_version {{
+                        id
+                        is_draft
+                        current_model_deployment_status {{
+                            status
+                        }}
+                    }}
+                }}
+                chain {{
+                  id
+                }}
+            }}
+        }}
+        """
+        resp = self._post_graphql_query(query_string)
+        chainlets = resp["data"]["chain_deployment"]["chainlets"]
+        for chainlet in chainlets:
+            chainlet["chain"] = {"id": resp["data"]["chain_deployment"]["chain"]["id"]}
+        return chainlets
+
+    def delete_chain(self, chain_id: str) -> Any:
+        return self._rest_api_client.delete(f"v1/chains/{chain_id}")
+
+    def delete_chain_deployment(self, chain_id: str, chain_deployment_id: str) -> Any:
+        return self._rest_api_client.delete(
+            f"v1/chains/{chain_id}/deployments/{chain_deployment_id}"
+        )
+
+    def deactivate_chain_deployment(
+        self, chain_id: str, chain_deployment_id: str
+    ) -> Any:
+        return self._rest_api_client.post(
+            f"v1/chains/{chain_id}/deployments/{chain_deployment_id}/deactivate",
+            body={},
+        )
+
+    def models(self, team_id: Optional[str] = None):
+        # If team_id is provided, filter by team; otherwise get all models
+        if team_id:
+            filter_arg = f'team_id: "{team_id}"'
+        else:
+            filter_arg = "all: true"
+
+        query_string = f"""
+        {{
+            models({filter_arg}) {{
+                id,
+                name
+                team {{
+                    id
+                    name
+                }}
+            }}
+        }}
+        """
+
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]
+
+    def get_models_for_watch(
+        self, team_id: Optional[str] = None, chainlets_only: Optional[bool] = False
+    ):
+        """Get lightweight model info (id/name/team) for watch disambiguation.
+
+        Only the fields needed to identify and disambiguate a model by name are
+        requested. Version info (including the potentially large ``truss_signature``)
+        is loaded separately for the single resolved model via
+        :meth:`get_model_with_versions_by_id`, to avoid fetching signatures for
+        every model in the team.
+        """
+        # If team_id is provided, filter by team; otherwise get all models
+        if team_id:
+            filter_arg = f'team_id: "{team_id}"'
+        else:
+            filter_arg = "all: true"
+
+        # Add chainlets_only filter to query chainlet oracles (origin=CHAINS)
+        # instead of regular models (origin=BASETEN). Only include if True.
+        if chainlets_only:
+            filter_arg += ", chainlets_only: true"
+
+        query_string = f"""
+        {{
+            models({filter_arg}) {{
+                id
+                name
+                team {{
+                    id
+                    name
+                }}
+            }}
+        }}
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]
+
+    def get_model_with_versions_by_id(self, model_id: str):
+        """Get a single model with full version info needed for watch.
+
+        Returns the model identified by ``model_id`` along with its versions,
+        including ``truss_hash`` and ``truss_signature`` used to compute patches.
+        """
+        query_string = f"""
+        {{
+            model(id: "{model_id}") {{
+                id
+                name
+                hostname
+                team {{
+                    id
+                    name
+                }}
+                versions {{
+                    id
+                    semver
+                    truss_hash
+                    truss_signature
+                    is_draft
+                    is_primary
+                    current_model_deployment_status {{
+                        status
+                    }}
+                }}
+            }}
+        }}
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]
+
+    def get_truss_watch_state(self, model_id: str):
+        query_string = f"""
+        {{
+            truss_watch_state(id: "{model_id}") {{
+                is_container_built_from_push
+                django_patch_state {{
+                    current_hash
+                    current_signature
+                }}
+                container_patch_state {{
+                    current_hash
+                    current_signature
+                }}
+            }}
+        }}
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]
+
+    def get_model(self, model_name: str):
+        query_string = f"""
+        {{
+            model(name: "{model_name}") {{
+                id
+                name
+                hostname
+                team {{
+                    id
+                    name
+                }}
+                versions {{
+                    id
+                    semver
+                    truss_hash
+                    truss_signature
+                    is_draft
+                    is_primary
+                    current_model_deployment_status {{
+                        status
+                    }}
+                }}
+            }}
+        }}
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]
+
+    def get_model_by_id(self, model_id: str):
+        query_string = f"""
+        {{
+            model(id: "{model_id}") {{
+                id
+                name
+                hostname
+                primary_version{{
+                    id
+                    semver
+                    truss_hash
+                    truss_signature
+                    is_draft
+                    current_model_deployment_status {{
+                        status
+                    }}
+                }}
+            }}
+          }}
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]
+
+    def get_model_version_by_id(self, model_version_id: str):
+        query_string = f"""
+        {{
+            model_version(id: "{model_version_id}") {{
+                id
+                is_draft
+                truss_hash
+                truss_signature
+                oracle{{
+                    id
+                    name
+                    hostname
+                }}
+            }}
+          }}
+        """
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]
+
+    def patch_draft_truss_two_step(self, model_id: str, patch_request):
+        patch = base64_encoded_json_str(patch_request.to_dict())
+        query_string = f"""
+        mutation ($trussUserEnv: String) {{
+            stage_patch_for_draft_truss(
+                id: "{model_id}"
+                truss_user_env: $trussUserEnv
+                patch: "{patch}"
+            ) {{
+                id
+                name
+                version_id
+                succeeded
+                needs_full_deploy
+                error
+            }}
+        }}
+        """
+        truss_user_env = b10_types.TrussUserEnv.collect().json()
+        resp = self._post_graphql_query(
+            query_string, variables={"trussUserEnv": truss_user_env}
+        )
+        result = resp["data"]["stage_patch_for_draft_truss"]
+        if not result["succeeded"]:
+            logging.debug(f"Failed to stage patch: {result}")
+            return result
+        logging.debug("Succesfully staged patch. Syncing patch to truss...")
+
+        return self.sync_draft_truss(model_id)
+
+    def sync_draft_truss(self, model_id: str):
+        query_string = f"""
+        mutation ($trussUserEnv: String) {{
+            sync_draft_truss(
+                id: "{model_id}"
+                truss_user_env: $trussUserEnv
+            ) {{
+                id
+                name
+                version_id
+                succeeded
+                needs_full_deploy
+                error
+            }}
+        }}
+        """
+        truss_user_env = b10_types.TrussUserEnv.collect().json()
+        resp = self._post_graphql_query(
+            query_string, variables={"trussUserEnv": truss_user_env}
+        )
+        result = resp["data"]["sync_draft_truss"]
+        if not result["succeeded"]:
+            logging.debug(f"Failed to sync patch: {result}")
+        return result
+
+    def validate_truss(self, config: str):
+        query_string = f"""
+        query ($trussUserEnv: String) {{
+            truss_validation(
+                truss_user_env: $trussUserEnv
+                config: "{config}"
+            ) {{
+                success
+                details
+            }}
+        }}
+        """
+        truss_user_env = b10_types.TrussUserEnv.collect().json()
+        resp = self._post_graphql_query(
+            query_string, variables={"trussUserEnv": truss_user_env}
+        )
+        return resp["data"]["truss_validation"]
+
+    def get_deployment(self, model_id: str, deployment_id: str) -> Any:
+        return self._rest_api_client.get(
+            f"v1/models/{model_id}/deployments/{deployment_id}"
+        )
+
+    def upsert_secret(self, name: str, value: str) -> Any:
+        return self._rest_api_client.post(
+            "v1/secrets", body={"name": name, "value": value}
+        )
+
+    def get_all_secrets(self) -> Any:
+        return self._rest_api_client.get("v1/secrets")
+
+    def get_team_secrets(self, team_id: str) -> Any:
+        """Every secret belonging to one team.
+
+        `get_all_secrets` spans every team the caller belongs to, so it cannot answer
+        whether a given team has a secret -- which is the scope the server validates
+        a `SecretReference` against.
+
+        The response is complete rather than paged, which callers rely on to read an
+        absent name as "does not exist".
+        """
+        return self._rest_api_client.get(f"v1/teams/{team_id}/secrets")
+
+    def upsert_team_secret(self, team_id: str, name: str, value: str) -> Any:
+        """Create or replace a secret in one team.
+
+        `upsert_secret` writes to the caller's primary team, which is not necessarily
+        the team a given workload resolves its secrets against.
+        """
+        return self._rest_api_client.post(
+            f"v1/teams/{team_id}/secrets", body={"name": name, "value": value}
+        )
+
+    # NOTE(Tyron): `name` is required because all official
+    # Baseten API keys should have a descriptive name.
+    def create_api_key(
+        self, api_key_type: APIKeyCategory, name: str, team_id: Optional[str] = None
+    ) -> Any:
+        """Create an API key, returning its plaintext value.
+
+        The value is returned only here; listing keys exposes their prefix alone. A
+        `team_id` confines the key to that team, and is rejected for key types that
+        cannot be team-scoped.
+        """
+        body: Dict[str, Any] = {"type": api_key_type.value, "name": name}
+        if team_id is not None:
+            body["team_id"] = team_id
+        return self._rest_api_client.post("v1/api_keys", body=body)
+
+    def upsert_training_project(self, training_project, team_id: Optional[str] = None):
+        if team_id:
+            endpoint = f"v1/teams/{team_id}/training_projects"
+        else:
+            endpoint = "v1/training_projects"
+        resp_json = self._rest_api_client.post(
+            endpoint,
+            body={"training_project": training_project.model_dump(exclude_none=True)},
+        )
+        return resp_json["training_project"]
+
+    def create_training_job(self, project_id: str, job):
+        resp_json = self._rest_api_client.post(
+            f"v1/training_projects/{project_id}/jobs",
+            body={"training_job": job.model_dump()},
+        )
+        return resp_json["training_job"]
+
+    def stop_training_job(self, project_id: str, job_id: str):
+        resp_json = self._rest_api_client.post(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/stop", body={}
+        )
+        return resp_json["training_job"]
+
+    def list_training_jobs(self, project_id: str):
+        # training_jobs, training_project
+        resp_json = self._rest_api_client.get(f"v1/training_projects/{project_id}/jobs")
+        return resp_json
+
+    def search_training_jobs(
+        self,
+        statuses: Optional[List[str]] = None,
+        project_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        order_by: List[dict[str, str]] = [{"field": "created_at", "order": "desc"}],
+    ):
+        resp_json = self._rest_api_client.post(
+            "v1/training_jobs/search",
+            body={
+                "statuses": statuses,
+                "project_id": project_id,
+                "job_id": job_id,
+                "order_by": order_by,
+            },
+        )
+        return resp_json["training_jobs"]
+
+    def get_training_job(self, project_id: str, job_id: str):
+        # training_job, training_project
+        resp_json = self._rest_api_client.get(
+            f"v1/training_projects/{project_id}/jobs/{job_id}"
+        )
+        return resp_json
+
+    def list_training_projects(self):
+        resp_json = self._rest_api_client.get("v1/training_projects")
+        return resp_json["training_projects"]
+
+    def get_blob_credentials(self, blob_type: b10_types.BlobType):
+        if blob_type == b10_types.BlobType.CHAIN:
+            return self.get_chain_s3_upload_credentials()
+        return self._rest_api_client.get(f"v1/blobs/credentials/{blob_type.value}")
+
+    def get_chain_s3_upload_credentials(self) -> ChainUploadCredentials:
+        """Get chain artifact credentials using GraphQL query."""
+        query = """
+        query {
+            chain_s3_upload_credentials {
+                s3_bucket
+                s3_key
+                aws_access_key_id
+                aws_secret_access_key
+                aws_session_token
+            }
+        }
+        """
+        response = self._post_graphql_query(query)
+
+        return ChainUploadCredentials.model_validate(
+            response["data"]["chain_s3_upload_credentials"]
+        )
+
+    def get_training_job_metrics(
+        self,
+        project_id: str,
+        job_id: str,
+        start_epoch_millis: Optional[int] = None,
+        end_epoch_millis: Optional[int] = None,
+    ):
+        resp_json = self._rest_api_client.post(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/metrics",
+            body=self._prepare_time_range_query(start_epoch_millis, end_epoch_millis),
+        )
+        return resp_json
+
+    def recreate_training_job(self, project_id: str, job_id: str):
+        resp_json = self._rest_api_client.post(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/recreate", body={}
+        )
+        return resp_json["training_job"]
+
+    def update_training_job(
+        self,
+        project_id: str,
+        job_id: str,
+        *,
+        priority: Optional[int] = None,
+        availability_model: Optional[str] = None,
+    ):
+        body: Dict[str, Any] = {}
+        if priority is not None:
+            body["priority"] = priority
+        if availability_model is not None:
+            body["availability_model"] = availability_model
+        resp_json = self._rest_api_client.patch(
+            f"v1/training_projects/{project_id}/jobs/{job_id}", body=body
+        )
+        return resp_json["training_job"]
+
+    def get_training_capacity(self) -> dict:
+        """Return the org- and team-level GPU capacity payload.
+
+        Shape: ``{"gpu_capacities": [...], "team_gpu_capacities": [...]}``.
+        """
+        return self._rest_api_client.get("v1/training/capacity")
+
+    def update_team_training_gpu_capacity(
+        self, team_id: str, gpu_type: str, max_gpus: int
+    ) -> dict:
+        resp_json = self._rest_api_client.patch(
+            "v1/training/capacity",
+            body={"team_id": team_id, "gpu_type": gpu_type, "max_gpus": max_gpus},
+        )
+        return resp_json["team_gpu_capacity"]
+
+    def list_training_job_checkpoints(self, project_id: str, job_id: str):
+        resp_json = self._rest_api_client.get(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/checkpoints"
+        )
+        return resp_json
+
+    def list_loops_runs(
+        self,
+        run_id: Optional[str] = None,
+        base_model: Optional[str] = None,
+        scope: Optional[str] = None,
+    ):
+        # scope="org" lists every run in the caller's org (each with its owning
+        # user); omit/"mine" lists just the caller's.
+        params: Dict[str, str] = {}
+        if run_id is not None:
+            params["run_id"] = run_id
+        if base_model is not None:
+            params["base_model"] = base_model
+        if scope is not None:
+            params["scope"] = scope
+        resp_json = self._rest_api_client.get("v1/loops/runs", url_params=params)
+        return resp_json["runs"]
+
+    def list_loops_checkpoints(
+        self,
+        run_id: Optional[str] = None,
+        base_model: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+    ):
+        params: Dict[str, str] = {}
+        if run_id is not None:
+            params["run_id"] = run_id
+        if base_model is not None:
+            params["base_model"] = base_model
+        if checkpoint_path is not None:
+            params["checkpoint_path"] = checkpoint_path
+        resp_json = self._rest_api_client.get("v1/loops/checkpoints", url_params=params)
+        return resp_json
+
+    def get_training_job_isession(self, project_id: str, job_id: str):
+        resp_json = self._rest_api_client.get(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/auth_codes"
+        )
+        return resp_json
+
+    def patch_interactive_session(
+        self,
+        project_id: str,
+        job_id: str,
+        session_id: str,
+        timeout_minutes: Optional[int] = None,
+        trigger: Optional[str] = None,
+    ):
+        """Patch an interactive session's timeout or trigger.
+
+        For on_startup sessions, timeout_minutes extends expires_at by that
+        many minutes.  For on_demand / on_failure sessions it replaces the
+        stored timeout_minutes value.  trigger cannot be changed on
+        on_startup sessions.
+        """
+        body: Dict[str, Any] = {}
+        if timeout_minutes is not None:
+            body["timeout_minutes"] = timeout_minutes
+        if trigger is not None:
+            body["trigger"] = trigger
+        resp_json = self._rest_api_client.patch(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/interactive_sessions/{session_id}",
+            body,
+        )
+        return resp_json
+
+    def sign_ssh_certificate(
+        self, project_id: str, job_id: str, public_key: str, replica_id: str
+    ) -> dict:
+        resp_json = self._rest_api_client.post(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/ssh/sign",
+            body={"public_key": public_key, "replica_id": replica_id},
+        )
+        return resp_json
+
+    def _prepare_time_range_query(
+        self,
+        start_epoch_millis: Optional[int] = None,
+        end_epoch_millis: Optional[int] = None,
+    ) -> Mapping[str, int]:
+        payload = {}
+        if start_epoch_millis:
+            payload["start_epoch_millis"] = start_epoch_millis
+        if end_epoch_millis:
+            payload["end_epoch_millis"] = end_epoch_millis
+        return payload
+
+    def get_training_job_logs(
+        self,
+        project_id: str,
+        job_id: str,
+        start_epoch_millis: Optional[int] = None,
+        end_epoch_millis: Optional[int] = None,
+    ):
+        resp_json = self._rest_api_client.post(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/logs",
+            body=self._prepare_time_range_query(start_epoch_millis, end_epoch_millis),
+        )
+
+        # NB(nikhil): reverse order so latest logs are at the end
+        return resp_json["logs"][::-1]
+
+    def get_cache_summary(self, project_id: str):
+        """Get cache summary for a training project."""
+        resp_json = self._rest_api_client.get(
+            f"v1/training_projects/{project_id}/cache/summary"
+        )
+        return resp_json
+
+    def _fetch_log_batch(
+        self, project_id: str, job_id: str, query_params: Dict[str, Any]
+    ) -> List[Any]:
+        """
+        Fetch a single batch of logs from the API.
+        """
+        resp_json = self._rest_api_client.post(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/logs", body=query_params
+        )
+        return resp_json["logs"]
+
+    def get_training_job_checkpoint_presigned_url(
+        self, project_id: str, job_id: str, page_size: int = 100
+    ) -> List[Dict[str, str]]:
+        all_presigned_urls = []
+        page_token: Optional[str] = None
+        max_iterations = 1000
+
+        for iteration in range(max_iterations):
+            url = f"v1/training_projects/{project_id}/jobs/{job_id}/checkpoint_files"
+            params = {"page_size": str(page_size)}
+            if page_token:
+                params["page_token"] = str(page_token)
+
+            response = self._rest_api_client.get(url, url_params=params)
+            all_presigned_urls.extend(response.get("presigned_urls", []))
+
+            page_token = response.get("next_page_token")
+            if not page_token:
+                break
+        else:
+            # If we reach here, it means we hit the max iterations without finding a next page token
+            logging.error(
+                f"Reached maximum iteration limit ({max_iterations}) while paginating "
+                f"checkpoint files for project_id={project_id}, job_id={job_id}"
+            )
+
+        return all_presigned_urls
+
+    def get_training_job_presigned_url(self, project_id: str, job_id: str) -> str:
+        response = self._rest_api_client.get(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/download"
+        )
+
+        presigned_url = response["artifact_presigned_urls"][0]
+
+        return presigned_url
+
+    def get_from_presigned_url(self, presigned_url: str) -> bytes:
+        response = requests.get(presigned_url)
+        return response.content
+
+    def get_deployment_download_url(self, model_id: str, deployment_id: str) -> str:
+        response = self._rest_api_client.get(
+            f"v1/models/{model_id}/deployments/{deployment_id}/download"
+        )
+        return response["download_url"]
+
+    def get_deployment_config(
+        self, model_id: str, deployment_id: str
+    ) -> Dict[str, Any]:
+        return self._rest_api_client.get(
+            f"v1/models/{model_id}/deployments/{deployment_id}/config"
+        )
+
+    def get_model_deployment_logs(
+        self,
+        model_id: str,
+        deployment_id: str,
+        start_epoch_millis: Optional[int] = None,
+        end_epoch_millis: Optional[int] = None,
+        min_level: Optional[str] = None,
+        replica: Optional[str] = None,
+        request_id: Optional[str] = None,
+        search_pattern: Optional[str] = None,
+        includes: Optional[List[str]] = None,
+        excludes: Optional[List[str]] = None,
+    ):
+        body: Dict[str, Any] = dict(
+            self._prepare_time_range_query(start_epoch_millis, end_epoch_millis)
+        )
+        if min_level:
+            body["min_level"] = min_level
+        if replica:
+            body["replica"] = replica
+        if request_id:
+            body["request_id"] = request_id
+        if search_pattern:
+            body["search_pattern"] = search_pattern
+        if includes:
+            body["includes"] = includes
+        if excludes:
+            body["excludes"] = excludes
+
+        resp_json = self._rest_api_client.post(
+            f"v1/models/{model_id}/deployments/{deployment_id}/logs", body=body
+        )
+
+        # NB(nikhil): reverse order so latest logs are at the end
+        return resp_json["logs"][::-1]
+
+    def get_loops_deployment_logs(
+        self,
+        loops_deployment_id: str,
+        start_epoch_millis: Optional[int] = None,
+        end_epoch_millis: Optional[int] = None,
+    ):
+        """Fetch logs for a Loops deployment.
+
+        Backend endpoint is GET-only — uses query params, not a request body
+        like the training-job / model-deployment endpoints.
+        """
+        params: Dict[str, str] = {}
+        if start_epoch_millis:
+            params["start_epoch_millis"] = str(start_epoch_millis)
+        if end_epoch_millis:
+            params["end_epoch_millis"] = str(end_epoch_millis)
+
+        resp_json = self._rest_api_client.get(
+            f"v1/loops/deployments/{loops_deployment_id}/logs", url_params=params
+        )
+        # Reverse so latest logs are at the end (matches the training-job /
+        # model-deployment helpers above).
+        return resp_json["logs"][::-1]
+
+    def create_model_version_from_inference_template(self, request_data: dict):
+        """
+        Create a model version from an inference template using GraphQL mutation.
+
+        Args:
+            request_data: Dictionary containing the request structure with metadata,
+                         weights_sources, inference_stack, and instance_type_id
+        """
+        query_string = """
+        mutation ($request: CreateModelVersionFromInferenceTemplateRequest!) {
+            create_model_version_from_inference_template(request: $request) {
+                model_version {
+                    id
+                    name
+                    model_id
+                }
+                truss_config
+            }
+        }
+        """
+        resp = self._post_graphql_query(
+            query_string, variables={"request": request_data}
+        )
+        return resp["data"]["create_model_version_from_inference_template"]
+
+    def get_instance_types(self) -> List[InstanceTypeV1]:
+        """
+        Get all available instance types via GraphQL API.
+        """
+        query_string = """
+        query Instances {
+            listedInstances: listed_instances {
+                id
+                name
+                millicpuLimit: millicpu_limit
+                memoryLimit: memory_limit
+                gpuCount: gpu_count
+                gpuType: gpu_type
+                gpuMemory: gpu_memory
+                default
+                displayName: display_name
+                nodeCount: node_count
+                price
+                limitedCapacity: limited_capacity
+            }
+        }
+        """
+
+        resp = self._post_graphql_query(query_string)
+        instance_types_data = resp["data"]["listedInstances"]
+        return [
+            InstanceTypeV1(**instance_type) for instance_type in instance_types_data
+        ]
+
+    def get_teams(self) -> Dict[str, TeamType]:
+        """
+        Get all available teams via GraphQL API.
+        Returns a dictionary mapping team name to team data.
+        """
+        query_string = """
+        query Teams {
+            teams {
+                id
+                name
+                default
+            }
+        }
+        """
+
+        resp = self._post_graphql_query(query_string)
+        teams_data = resp["data"]["teams"]
+        # Convert list to dict mapping team_name -> team
+        return {team["name"]: TeamType(**team) for team in teams_data}
+
+    def get_organization_id(self) -> str:
+        """
+        Get the organization ID via GraphQL API.
+        Returns the organization identifier.
+        """
+        query_string = """
+        query {
+            organization {
+                id
+            }
+        }
+        """
+
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]["organization"]["id"]
+
+    def get_aws_assume_role_info(self) -> dict:
+        """
+        Get the AWS AssumeRole trust-policy inputs for this organization: the
+        Baseten role ARN to allow and the sts:ExternalId Baseten presents.
+        Both fields are null unless AWS AssumeRole is enabled for the
+        organization.
+        """
+        query_string = """
+        query {
+            organization {
+                aws_customer_access_role_arn
+                aws_external_id
+            }
+        }
+        """
+
+        resp = self._post_graphql_query(query_string)
+        return resp["data"]["organization"]
+
+    def update_interactive_session(
+        self,
+        project_id: str,
+        job_id: str,
+        trigger: Optional[str] = None,
+        timeout_minutes: Optional[int] = None,
+    ):
+        """Update interactive session configuration for a training job."""
+        body: Dict[str, Any] = {}
+        if trigger is not None:
+            body["trigger"] = trigger
+        if timeout_minutes is not None:
+            body["timeout_minutes"] = timeout_minutes
+
+        resp_json = self._rest_api_client.patch(
+            f"v1/training_projects/{project_id}/jobs/{job_id}/interactive_session",
+            body=body,
+        )
+        return resp_json
+
+    def create_bis_llm_model(self, body: dict, team_id: Optional[str] = None) -> dict:
+        endpoint = f"v1/teams/{team_id}/llm_models" if team_id else "v1/llm_models"
+        return self._rest_api_client.post(endpoint, body=body)
+
+    def create_bis_llm_model_version(self, model_id: str, body: dict) -> dict:
+        return self._rest_api_client.post(
+            f"v1/llm_models/{model_id}/deployments", body=body
+        )
+
+    def create_loops_session(self, training_project_id: Optional[str] = None) -> dict:
+        body: Dict[str, Any] = {}
+        if training_project_id is not None:
+            body["training_project_id"] = training_project_id
+        resp_json = self._rest_api_client.post("v1/loops/sessions", body=body)
+        return resp_json["session"]
+
+    def create_loops_run(
+        self,
+        session_id: str,
+        base_model: str,
+        seed: Optional[int] = None,
+        replicas: Optional[int] = None,
+        sampler_num_replicas: Optional[int] = None,
+    ) -> dict:
+        body: Dict[str, Any] = {"session_id": session_id, "base_model": base_model}
+        if seed is not None:
+            body["seed"] = seed
+        if replicas is not None:
+            body["replicas"] = replicas
+        if sampler_num_replicas is not None:
+            body["sampler_num_replicas"] = sampler_num_replicas
+        resp_json = self._rest_api_client.post("v1/loops/runs", body=body)
+        return resp_json["run"]
+
+    def get_loops_session(self, session_id: str) -> dict:
+        resp_json = self._rest_api_client.get(f"v1/loops/sessions/{session_id}")
+        return resp_json["session"]
+
+    def get_loops_run(self, run_id: str) -> dict:
+        resp_json = self._rest_api_client.get(f"v1/loops/runs/{run_id}")
+        return resp_json["run"]
+
+    def get_loops_sampler(self, sampler_id: str) -> dict:
+        resp_json = self._rest_api_client.get(f"v1/loops/samplers/{sampler_id}")
+        return resp_json["sampler"]
+
+    def list_loops_deployments(
+        self, scope: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        # scope="org" lists every deployment in the caller's org (each with its
+        # owning user); omit/"mine" lists just the caller's.
+        url_params = {"scope": scope} if scope else {}
+        resp_json = self._rest_api_client.get(
+            "v1/loops/deployments", url_params=url_params
+        )
+        return resp_json["deployments"]
+
+    def get_loops_deployment(self, deployment_id: str) -> dict:
+        resp_json = self._rest_api_client.get(f"v1/loops/deployments/{deployment_id}")
+        return resp_json["deployment"]
+
+    def list_loops_samplers(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
+        # scope="org" lists every sampler in the caller's org (paired and
+        # standalone); omit/"mine" lists just the caller's.
+        url_params = {"scope": scope} if scope else {}
+        resp_json = self._rest_api_client.get(
+            "v1/loops/samplers", url_params=url_params
+        )
+        return resp_json["samplers"]
+
+    def list_loops_checkpoint_files(
+        self, checkpoint_id: str, page_size: int = 1000
+    ) -> List[Dict[str, str]]:
+        """Fetch all presigned URLs for files under a Loops checkpoint."""
+        all_presigned_urls: List[Dict[str, str]] = []
+        page_token: Optional[str] = None
+        max_iterations = 1000
+        for _ in range(max_iterations):
+            params: Dict[str, str] = {"page_size": str(page_size)}
+            if page_token:
+                params["page_token"] = page_token
+            response = self._rest_api_client.get(
+                f"v1/loops/checkpoints/{checkpoint_id}/files", url_params=params
+            )
+            all_presigned_urls.extend(response.get("presigned_urls", []))
+            page_token = response.get("next_page_token")
+            if not page_token:
+                break
+        else:
+            logging.error(
+                "Reached maximum iteration limit (%d) while paginating Loops "
+                "checkpoint files for checkpoint_id=%s",
+                max_iterations,
+                checkpoint_id,
+            )
+        return all_presigned_urls
+
+    def deactivate_loops_deployment(self, deployment_id: str) -> None:
+        self._rest_api_client.post(
+            f"v1/loops/deployments/{deployment_id}/deactivate", body={}
+        )
+
+    def deactivate_loops_run(self, run_id: str) -> None:
+        """Deactivate the Loops run with the given run id.
+
+        The server resolves the run to its underlying deployment and tears
+        down both halves of the run (the run itself and its paired sampler).
+        """
+        self._rest_api_client.post(f"v1/loops/runs/{run_id}/deactivate", body={})

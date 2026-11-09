@@ -1,0 +1,45 @@
+[package]
+name = "baseten_performance_client_core"
+version = "0.1.16"
+edition = "2021"
+description = "High performance HTTP client for Baseten.co and other APIs"
+license = "MIT"
+repository = "https://github.com/basetenlabs/truss/tree/main/baseten-performance-client"
+homepage = "https://github.com/basetenlabs/truss/tree/main/baseten-performance-client"
+documentation = "https://github.com/basetenlabs/truss/tree/main/baseten-performance-client"
+keywords = ["http", "client", "async", "performance", "baseten"]
+categories = ["web-programming::http-client", "asynchronous"]
+
+[dependencies]
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["http-json", "trace", "internal-logs", "gzip-http"] }
+opentelemetry-http = { version = "0.31", default-features = false, features = ["reqwest-blocking"] }
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+tokio = { workspace = true }
+reqwest = { workspace = true }
+openssl = { version = "0.10.75", features = ["vendored"], optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+rand = { workspace = true }
+uuid = { version = "1.19.0", features = ["v4"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+ctor = { workspace = true }
+nonempty = { workspace = true }
+
+[features]
+default = ["rustls", "auto-init-tracing"]
+auto-init-tracing = []
+native-tls = ["reqwest/default-tls", "reqwest/native-tls-alpn", "dep:openssl"]
+rustls = ["reqwest/rustls-tls", "reqwest/rustls-tls-webpki-roots"]
+
+[dev-dependencies]
+flate2 = "1"
+axum = { version = "0.7", features = ["http2", "tokio"] }

@@ -1,0 +1,41 @@
+name: "Setup Python"
+description: "sets up python, uv and associated cache"
+inputs:
+  python-version:
+    description: Python version to setup
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Determine Python version
+      id: determine-version
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.python-version }}" ]]; then
+          echo "version=${{ inputs.python-version }}" >> "$GITHUB_OUTPUT"
+        else
+          if [[ -f ".python-version" ]]; then
+            fallback_version=$(cat .python-version | tr -d '\n')
+          fi
+          echo "version=$fallback_version" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ steps.determine-version.outputs.version }}
+
+    - name: Show Python version
+      shell: bash
+      run: |
+        VERSION=$(python -c "import sys; print('-'.join(str(v) for v in sys.version_info))")
+        echo "version=$VERSION" >> $GITHUB_ENV
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        version: "0.7.12"
+        enable-cache: true
+        # NB(nikhil): Only search for top level `uv.lock` file.
+        cache-dependency-glob: "uv.lock"

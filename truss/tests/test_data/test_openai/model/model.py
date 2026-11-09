@@ -1,0 +1,24 @@
+from typing import Dict
+
+
+class Model:
+    def __init__(self, **kwargs):
+        pass
+
+    def chat_completions(self, input: Dict) -> str:
+        return "chat_completions"
+
+    def completions(self, input: Dict) -> str:
+        return "completions"
+
+    def embeddings(self, input: Dict) -> str:
+        return "embeddings"
+
+    def predict(self, input: Dict) -> str:
+        return "predict"
+
+    def messages(self, input: Dict) -> str:
+        return "messages"
+
+    def responses(self, input: Dict) -> str:
+        return "responses"

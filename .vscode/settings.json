@@ -1,0 +1,17 @@
+{
+  // Global settings that applies to all baseten developers
+  "python.formatting.provider": "charliermarsh.ruff",
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["truss"],
+
+  // Per file type settings
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll": "explicit",
+      "source.organizeImports": "explicit",
+      "source.sortMembers": "explicit"
+    }
+  }
+}
