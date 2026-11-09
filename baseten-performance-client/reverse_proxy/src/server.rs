@@ -70,7 +70,7 @@ pub async fn create_server(config: Arc<ProxyConfig>) -> Result<(), Box<dyn std::
         .route("/predict", any(handle_unified_request))
         .route("/classify", any(handle_unified_request))
         .route("/health_internal", get(handle_health_check))
-        .route("/*path", any(handle_unified_request)) // Catch-all for generic batch
+        .route("/{*path}", any(handle_unified_request)) // Catch-all for generic batch
         .layer(
             ServiceBuilder::new().layer(
                 CorsLayer::new()
