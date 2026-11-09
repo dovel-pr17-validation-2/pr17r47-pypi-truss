@@ -8,8 +8,8 @@ name = "truss_transfer"
 crate-type = ["cdylib"]  # For PyO3
 
 [dependencies]
-anyhow = "1.0"
-async-trait = "0.1"
+anyhow = "1.0.104"
+async-trait = "0.1.92"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 bytes = "1.5"
