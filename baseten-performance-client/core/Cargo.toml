@@ -42,4 +42,4 @@ rustls = ["reqwest/rustls-tls", "reqwest/rustls-tls-webpki-roots"]
 
 [dev-dependencies]
 flate2 = "1"
-axum = { version = "0.7", features = ["http2", "tokio"] }
+axum = { version = "0.7.9", features = ["http2", "tokio"] }
